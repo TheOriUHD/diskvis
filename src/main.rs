@@ -29,7 +29,9 @@ fn main() {
     }
 
     if !cli.path.exists() {
-        eprintln!("error: path does not exist: {}", cli.path.display());
+        if should_log_stderr(cli.verbose) {
+            eprintln!("error: path does not exist: {}", cli.path.display());
+        }
         process::exit(1);
     }
 
@@ -101,7 +103,9 @@ fn main() {
             if let Some(pb) = pb.as_ref() {
                 pb.finish_and_clear();
             }
-            eprintln!("error: {}", e);
+            if should_log_stderr(cli.verbose) {
+                eprintln!("error: {}", e);
+            }
             process::exit(1);
         }
     };
@@ -120,7 +124,9 @@ fn main() {
                 let _ = writeln!(h, "{}", s);
             }
             Err(e) => {
-                eprintln!("error: failed to serialize: {}", e);
+                if should_log_stderr(cli.verbose) {
+                    eprintln!("error: failed to serialize: {}", e);
+                }
                 process::exit(1);
             }
         }
@@ -130,7 +136,9 @@ fn main() {
     if interactive {
         let app = tui::App::new(root, path, cfg, cli.min_size, warnings);
         if let Err(e) = tui::run(app) {
-            eprintln!("error: {}", e);
+            if should_log_stderr(cli.verbose) {
+                eprintln!("error: {}", e);
+            }
             process::exit(1);
         }
     } else {
@@ -169,9 +177,29 @@ fn main() {
             },
         );
         // In plain mode, print warnings to stderr (TUI is not active).
-        for w in &warnings {
-            eprintln!("warning: {}", w);
+        if should_log_stderr(cli.verbose) {
+            for w in &warnings {
+                eprintln!("warning: {}", w);
+            }
         }
+    }
+}
+
+/// Whether non-fatal warnings/errors should be written to stderr.
+///
+/// On Windows the stderr stream from a console app often surfaces in the
+/// debug console / parent shell in unexpected ways, so we suppress it by
+/// default and require an explicit `--verbose` flag. On other platforms
+/// stderr is always logged.
+fn should_log_stderr(verbose: bool) -> bool {
+    #[cfg(windows)]
+    {
+        verbose
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = verbose;
+        true
     }
 }
 

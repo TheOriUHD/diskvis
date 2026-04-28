@@ -81,4 +81,8 @@ pub struct Cli {
     /// Show last modified date next to each entry
     #[arg(long = "modified")]
     pub modified: bool,
+
+    /// Print warnings and non-fatal errors to stderr (default on Unix; required on Windows)
+    #[arg(short = 'v', long = "verbose")]
+    pub verbose: bool,
 }

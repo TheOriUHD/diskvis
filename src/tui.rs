@@ -95,6 +95,7 @@ enum Action {
     OpenHelp,
     OpenSettings,
     CloseOverlay,
+    Quit,
     OpenWarnings,
     SelectRow(usize),
     DrillRow(usize),
@@ -145,6 +146,9 @@ pub struct App {
     pub spotlight: Option<SpotlightState>,
     spot_tx: Option<Sender<SpotlightReq>>,
     spot_rx: Option<Receiver<SpotlightResp>>,
+    /// Set when the user requests application exit (e.g. clicks the [✕]
+    /// title-bar button). Polled by the run loop.
+    pub should_quit: bool,
 }
 
 #[derive(Clone)]
@@ -201,6 +205,7 @@ impl App {
             spotlight: None,
             spot_tx: None,
             spot_rx: None,
+            should_quit: false,
         }
     }
 
@@ -399,6 +404,20 @@ impl App {
             });
         }
         for (i, pat) in self.config.excludes.iter().enumerate() {
+            #[cfg(windows)]
+            {
+                // Linux pseudo-filesystem excludes have no analog on Windows.
+                if matches!(
+                    pat.as_str(),
+                    "/proc" | "/sys" | "/dev" | "/run" | "/tmp"
+                ) {
+                    continue;
+                }
+                // Hide any other absolute Unix-style path entries.
+                if pat.starts_with('/') {
+                    continue;
+                }
+            }
             let on = self.config.excludes_enabled.get(i).copied().unwrap_or(true);
             items.push(SettingItem {
                 label: format!("Exclude  [{}]  {}", if on { "x" } else { " " }, pat),
@@ -422,6 +441,18 @@ impl App {
 
     fn rescan_at(&mut self, path: PathBuf) {
         self.rescanning = true;
+        #[cfg(windows)]
+        {
+            if walker::is_this_pc(&path) {
+                self.root = walker::build_this_pc_node();
+                self.warnings.clear();
+                self.warnings_scroll = 0;
+                self.cursor = 0;
+                self.scroll = 0;
+                self.rescanning = false;
+                return;
+            }
+        }
         let mut excludes = self.config.active_excludes();
         excludes.extend(self.session_excludes.iter().cloned());
         let opts = WalkOptions {
@@ -453,6 +484,13 @@ impl App {
             self.rescan_at(prev);
         } else if let Some(parent) = self.root.path.parent().map(|p| p.to_path_buf()) {
             self.rescan_at(parent);
+        } else {
+            #[cfg(windows)]
+            {
+                if !walker::is_this_pc(&self.root.path) {
+                    self.rescan_at(walker::this_pc_sentinel());
+                }
+            }
         }
     }
 
@@ -671,7 +709,21 @@ impl App {
 fn split_input(input: &str) -> (PathBuf, String) {
     let expanded = expand_tilde(input);
     if expanded.is_empty() {
-        return (PathBuf::from("/"), String::new());
+        #[cfg(windows)]
+        {
+            return (walker::this_pc_sentinel(), String::new());
+        }
+        #[cfg(not(windows))]
+        {
+            return (PathBuf::from("/"), String::new());
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Bare "/" on Windows: also surface drives.
+        if expanded == "/" || expanded == "\\" {
+            return (walker::this_pc_sentinel(), String::new());
+        }
     }
     if expanded.ends_with('/') {
         let trimmed = expanded.trim_end_matches('/');
@@ -717,6 +769,21 @@ fn expand_tilde(input: &str) -> String {
 
 fn list_dir_entries(parent: &Path, _partial: &str) -> Vec<SpotlightEntry> {
     let mut out: Vec<SpotlightEntry> = Vec::new();
+    #[cfg(windows)]
+    {
+        if walker::is_this_pc(parent) {
+            for drive in walker::enumerate_drives() {
+                let name = drive.to_string_lossy().into_owned();
+                out.push(SpotlightEntry {
+                    path: drive,
+                    name,
+                    is_dir: true,
+                    size_hint: None,
+                });
+            }
+            return out;
+        }
+    }
     let dir = if parent.as_os_str().is_empty() {
         Path::new("/")
     } else {
@@ -836,6 +903,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                 }
                 Event::Mouse(m) => {
                     handle_mouse_event(app, m);
+                    if app.should_quit {
+                        return Ok(());
+                    }
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -1403,6 +1473,12 @@ fn apply_action(app: &mut App, action: Action, is_double: bool) {
             }
             app.view = View::Main;
         }
+        Action::Quit => {
+            if app.view == View::Settings {
+                app.save_settings();
+            }
+            app.should_quit = true;
+        }
         Action::OpenWarnings => {
             app.warnings_scroll = 0;
             app.view = View::Warnings;
@@ -1580,7 +1656,7 @@ fn draw_title(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let right_btns: [(&str, Action); 3] = [
         ("[?]", Action::OpenHelp),
         ("[⚙]", Action::OpenSettings),
-        ("[✕]", Action::CloseOverlay),
+        ("[✕]", Action::Quit),
     ];
     let right_total: u16 = right_btns
         .iter()
@@ -1593,6 +1669,7 @@ fn draw_title(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             let rect = Rect::new(rx, y, w, 1);
             let style = match act {
                 Action::CloseOverlay => Style::default().fg(Color::Red),
+                Action::Quit => Style::default().fg(Color::Red),
                 _ => Style::default().fg(Color::Yellow),
             };
             f.render_widget(
@@ -2120,7 +2197,19 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             "Enter/Space: toggle  +/-: depth  PgUp/PgDn: scroll  q/Esc: close (saves)",
             Style::default().fg(Color::DarkGray),
         )),
-        Line::from(""),
+        Line::from({
+            #[cfg(windows)]
+            {
+                Span::styled(
+                    "Running on Windows",
+                    Style::default().fg(Color::Blue),
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                Span::raw("")
+            }
+        }),
     ];
 
     let inner_x = popup.x + 1;

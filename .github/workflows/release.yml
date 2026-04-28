@@ -122,11 +122,22 @@ jobs:
       - name: Rename binary
         shell: pwsh
         run: Copy-Item target/x86_64-pc-windows-msvc/release/diskvis.exe diskvis-windows-x86_64.exe
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { $nsis = "makensis" }
+          & $nsis installer/diskvis.nsi
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
-          path: diskvis-windows-x86_64.exe
+          path: |
+            diskvis-windows-x86_64.exe
+            diskvis-setup-x86_64.exe
 
   release:
     name: Publish release

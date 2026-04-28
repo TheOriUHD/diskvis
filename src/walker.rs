@@ -108,6 +108,60 @@ pub fn vfs_excludes() -> Vec<&'static str> {
     vec![]
 }
 
+/// On Windows, enumerate available drive letters by probing `A:\`..`Z:\`.
+/// Returns the drive root as a `PathBuf` (e.g. `C:\`).
+#[cfg(windows)]
+pub fn enumerate_drives() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let p = PathBuf::from(format!("{}:\\", letter as char));
+        if p.exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Sentinel path representing the synthetic Windows "This PC" root.
+#[cfg(windows)]
+pub fn this_pc_sentinel() -> PathBuf {
+    PathBuf::from(r"\\?\ThisPC")
+}
+
+/// Build a synthetic [`Node`] tree representing "This PC" — a virtual root
+/// whose children are each available drive (Windows-only).
+#[cfg(windows)]
+pub fn build_this_pc_node() -> Node {
+    let drives = enumerate_drives();
+    let children: Vec<Node> = drives
+        .into_iter()
+        .map(|p| {
+            let name = p.to_string_lossy().into_owned();
+            Node {
+                path: p,
+                name,
+                size: 0,
+                is_dir: true,
+                modified: None,
+                children: Vec::new(),
+            }
+        })
+        .collect();
+    Node {
+        path: this_pc_sentinel(),
+        name: "[This PC]".to_string(),
+        size: 0,
+        is_dir: true,
+        modified: None,
+        children,
+    }
+}
+
+#[cfg(windows)]
+pub fn is_this_pc(p: &Path) -> bool {
+    p == this_pc_sentinel().as_path()
+}
+
 pub struct ScanResult {
     pub root: Node,
     /// Warnings collected during the walk (permission errors, IO failures, etc.).
