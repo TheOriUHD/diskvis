@@ -176,11 +176,18 @@ Section "diskvis (required)" SecCore
     WriteRegStr HKLM "${APP_REGKEY}" "URLInfoAbout" "${APP_URL}"
     WriteRegStr HKLM "${APP_REGKEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
     WriteRegStr HKLM "${APP_REGKEY}" "InstallLocation" "$INSTDIR"
-    WriteRegStr HKLM "${APP_REGKEY}" "DisplayIcon" "$INSTDIR\${APP_EXE}"
     WriteRegDWORD HKLM "${APP_REGKEY}" "NoModify" 1
     WriteRegDWORD HKLM "${APP_REGKEY}" "NoRepair" 1
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
+
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "DisplayName" "diskvis"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "UninstallString" "$INSTDIR\uninstall.exe"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "DisplayVersion" "1.3.0"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "Publisher" "TheOriUHD"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "DisplayIcon" "$INSTDIR\diskvis.exe"
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis" "NoRepair" 1
 SectionEnd
 
 Section "Start Menu shortcut" SecShortcut
@@ -213,5 +220,6 @@ Section "Uninstall"
     RMDir  "$SMPROGRAMS\${APP_NAME}"
 
     DeleteRegKey HKLM "${APP_REGKEY}"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis"
     DeleteRegKey HKLM "Software\${APP_NAME}"
 SectionEnd
