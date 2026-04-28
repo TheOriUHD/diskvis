@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
@@ -42,7 +42,7 @@ pub enum EditorPrompt {
     /// Goto-line input at the bottom.
     GotoLine { input: String },
     /// Status / error message shown briefly at the bottom.
-    Message { text: String, until: Instant },
+    Message { text: String },
     /// Confirmation that the file is large or appears binary.
     LargeFile { selection: u8, size: u64 },
 }
@@ -210,7 +210,6 @@ impl Editor {
     fn flash(&mut self, text: impl Into<String>) {
         self.prompt = Some(EditorPrompt::Message {
             text: text.into(),
-            until: Instant::now() + Duration::from_secs(2),
         });
     }
 
@@ -752,12 +751,13 @@ impl Editor {
                     EditorOutcome::Continue
                 }
             },
-            EditorPrompt::Message { until, .. } => {
-                // Any keypress dismisses; otherwise let the next draw clear it.
-                if Instant::now() >= until {
-                    self.prompt = None;
-                }
-                self.handle_key(key)
+            EditorPrompt::Message { .. } => {
+                // Any keypress dismisses the flash message. The keystroke
+                // itself is consumed (no recursion into `handle_key` — that
+                // produced an infinite loop because the prompt was still
+                // observed by the recursive call before being cleared).
+                self.prompt = None;
+                EditorOutcome::Continue
             }
         }
     }
@@ -876,18 +876,83 @@ impl Editor {
                         Style::default().bg(Color::Rgb(30, 30, 45)),
                     ));
                 }
-                // Re-style spans with a row background — rebuild the line below.
+                // Inject the cursor block at the correct visible column.
+                let cursor_disp = display_col_of(self.cur_line(), self.cursor.1);
+                let cursor_visible = cursor_disp.saturating_sub(self.scroll_col);
+                let cursor_visible = cursor_visible.min(body_w.saturating_sub(1));
                 let bg = Color::Rgb(30, 30, 45);
-                let line = Line::from(
-                    spans
-                        .into_iter()
-                        .map(|s| {
-                            let st = s.style.bg(bg);
-                            Span::styled(s.content.into_owned(), st)
-                        })
-                        .collect::<Vec<_>>(),
+                let cursor_block = Span::styled(
+                    "█".to_string(),
+                    Style::default()
+                        .fg(Color::Rgb(255, 200, 0))
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
                 );
-                out.push(line);
+
+                // Walk the existing spans (gutter at index 0 is preserved
+                // verbatim) counting display columns within the body, and
+                // splice the cursor block in at `cursor_visible`. The
+                // underlying char under the cursor is overwritten by the
+                // block.
+                let mut new_spans: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 2);
+                if let Some(g) = spans.first() {
+                    new_spans.push(Span::styled(g.content.clone().into_owned(), g.style));
+                }
+                let mut col = 0usize;
+                let mut inserted = false;
+                for span in spans.iter().skip(1) {
+                    let style = span.style.bg(bg);
+                    if inserted {
+                        new_spans.push(Span::styled(span.content.clone().into_owned(), style));
+                        continue;
+                    }
+                    let text: &str = &span.content;
+                    let span_chars: Vec<char> = text.chars().collect();
+                    let mut before = String::new();
+                    let mut consumed = 0usize;
+                    let mut hit = false;
+                    for (i, ch) in span_chars.iter().enumerate() {
+                        if col == cursor_visible {
+                            if !before.is_empty() {
+                                new_spans.push(Span::styled(before.clone(), style));
+                            }
+                            new_spans.push(cursor_block.clone());
+                            // Skip the character under the cursor — the block
+                            // visually replaces it.
+                            consumed = i + 1;
+                            col += 1;
+                            hit = true;
+                            break;
+                        }
+                        before.push(*ch);
+                        consumed += 1;
+                        col += 1;
+                    }
+                    if hit {
+                        let rest: String = span_chars[consumed..].iter().collect();
+                        if !rest.is_empty() {
+                            new_spans.push(Span::styled(rest, style));
+                        }
+                        inserted = true;
+                    } else {
+                        if !before.is_empty() {
+                            new_spans.push(Span::styled(before, style));
+                        }
+                    }
+                }
+                if !inserted {
+                    // Cursor sits past the end of rendered content (empty
+                    // line or past EOL): pad with spaces and emit the block.
+                    let pad = cursor_visible.saturating_sub(col);
+                    if pad > 0 {
+                        new_spans.push(Span::styled(
+                            " ".repeat(pad),
+                            Style::default().bg(bg),
+                        ));
+                    }
+                    new_spans.push(cursor_block);
+                }
+                out.push(Line::from(new_spans));
             } else {
                 out.push(Line::from(spans));
             }
