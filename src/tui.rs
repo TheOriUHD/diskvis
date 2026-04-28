@@ -494,33 +494,10 @@ impl App {
             return;
         };
         let s = p.display().to_string();
-        let candidates: [(&str, &[&str]); 4] = [
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-            ("pbcopy", &[]),
-        ];
-        for (cmd, args) in candidates.iter() {
-            match Command::new(cmd)
-                .args(*args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use std::io::Write;
-                        let _ = stdin.write_all(s.as_bytes());
-                    }
-                    let _ = child.wait();
-                    self.flash(format!("yanked path via {}", cmd));
-                    return;
-                }
-                Err(_) => continue,
-            }
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(s.clone())) {
+            Ok(()) => self.flash("yanked path to clipboard"),
+            Err(e) => self.flash(format!("clipboard error: {}", e)),
         }
-        self.flash("no clipboard tool found (install xclip/xsel/wl-copy)");
     }
 
     fn open_selected(&mut self) {
@@ -528,20 +505,24 @@ impl App {
             self.flash("nothing selected");
             return;
         };
-        let candidates = ["xdg-open", "open"];
-        for cmd in candidates.iter() {
-            if Command::new(cmd)
-                .arg(&p)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                self.flash(format!("opened with {}", cmd));
-                return;
-            }
+        #[cfg(target_os = "linux")]
+        let opener: &str = "xdg-open";
+        #[cfg(target_os = "macos")]
+        let opener: &str = "open";
+        #[cfg(target_os = "windows")]
+        let opener: &str = "explorer";
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let opener: &str = "xdg-open";
+
+        match Command::new(opener)
+            .arg(&p)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.flash(format!("opened with {}", opener)),
+            Err(_) => self.flash(format!("failed to launch {}", opener)),
         }
-        self.flash("no opener found (install xdg-open)");
     }
 
     fn exclude_selected(&mut self) {
@@ -561,7 +542,7 @@ impl App {
     }
 
     fn jump_home(&mut self) {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = dirs::home_dir() {
             self.nav_stack.push(self.root.path.clone());
             self.rescan_at(home);
         }
@@ -722,13 +703,13 @@ fn split_input(input: &str) -> (PathBuf, String) {
 
 fn expand_tilde(input: &str) -> String {
     if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), rest);
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
         }
     }
     if input == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return home.to_string_lossy().to_string();
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
         }
     }
     input.to_string()

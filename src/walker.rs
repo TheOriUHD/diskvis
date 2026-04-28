@@ -90,6 +90,24 @@ pub struct WalkOptions<'a> {
     pub on_progress: Option<&'a (dyn Fn(&Path) + Sync)>,
 }
 
+/// Default platform-specific virtual-filesystem excludes (absolute paths).
+/// On Unix these are pseudo-filesystems that should not be traversed by
+/// default; on Windows there is no equivalent.
+#[cfg(unix)]
+pub fn vfs_excludes() -> Vec<&'static str> {
+    vec!["/proc", "/sys", "/dev", "/run", "/tmp"]
+}
+
+#[cfg(windows)]
+pub fn vfs_excludes() -> Vec<&'static str> {
+    vec![]
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn vfs_excludes() -> Vec<&'static str> {
+    vec![]
+}
+
 pub struct ScanResult {
     pub root: Node,
     /// Warnings collected during the walk (permission errors, IO failures, etc.).

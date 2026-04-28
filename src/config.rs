@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Mode, SortBy, SortOrder};
+use crate::walker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -76,21 +77,20 @@ impl Default for Config {
 }
 
 pub fn default_excludes() -> Vec<String> {
-    vec![
+    let mut v = vec![
         "target".to_string(),
         ".git".to_string(),
         "node_modules".to_string(),
         ".DS_Store".to_string(),
-        "/proc".to_string(),
-        "/sys".to_string(),
-        "/dev".to_string(),
-        "/run".to_string(),
-        "/tmp".to_string(),
-    ]
+    ];
+    for p in walker::vfs_excludes() {
+        v.push(p.to_string());
+    }
+    v
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = dirs::home_dir()?;
     Some(home.join(".config").join("diskvis").join("config.toml"))
 }
 
