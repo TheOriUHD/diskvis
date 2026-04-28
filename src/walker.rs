@@ -70,6 +70,24 @@ impl Node {
         m & 0o002 != 0 || m & 0o4000 != 0 || m & 0o2000 != 0
     }
 
+    /// Empty stand-in node used by the TUI to repaint immediately while a
+    /// background scan is still running.
+    pub fn placeholder(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Node {
+            path,
+            name,
+            size: 0,
+            is_dir: true,
+            modified: None,
+            mode: None,
+            children: Vec::new(),
+        }
+    }
+
     pub fn file_count(&self) -> usize {
         if !self.is_dir {
             return 1;
@@ -144,14 +162,21 @@ pub fn build_tree(root: &Path, opts: &WalkOptions) -> std::io::Result<ScanResult
     }
     let mut node = Node::new(root.to_path_buf(), true, 0, meta.modified().ok(), mode);
     let mut warnings = Vec::new();
-    build_dir(&mut node, opts, &mut warnings);
+    let root_dev = meta.dev();
+    build_dir(&mut node, opts, &mut warnings, 0, root_dev);
     Ok(ScanResult {
         root: node,
         warnings,
     })
 }
 
-fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
+fn build_dir(
+    node: &mut Node,
+    opts: &WalkOptions,
+    warnings: &mut Vec<String>,
+    depth: usize,
+    root_dev: u64,
+) {
     if let Some(cb) = opts.on_progress {
         cb(&node.path);
     }
@@ -164,17 +189,14 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         }
     };
 
-    let mut leaves: Vec<Node> = Vec::new();
-    let mut subdirs: Vec<Node> = Vec::new();
+    // Materialize entries first so we can size-hint the children vecs and
+    // avoid repeated reallocations on directories with many siblings.
+    let entries: Vec<std::fs::DirEntry> = entries.filter_map(|e| e.ok()).collect();
+    let cap = entries.len();
+    let mut leaves: Vec<Node> = Vec::with_capacity(cap);
+    let mut subdirs: Vec<Node> = Vec::with_capacity(cap);
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                warnings.push(format!("{}: {}", node.path.display(), err));
-                continue;
-            }
-        };
         let path = entry.path();
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
@@ -182,6 +204,8 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
             continue;
         }
 
+        // Use DirEntry::metadata directly — saves a syscall versus calling
+        // fs::symlink_metadata(path) again.
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(err) => {
@@ -194,8 +218,19 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         let mode = Some(meta.mode());
 
         if meta.file_type().is_symlink() {
-            let size = meta.len();
-            leaves.push(Node::new(path, false, size, modified, mode));
+            // Resolve the symlink to decide whether to descend. Only follow
+            // when the target is a directory on the *same* filesystem as the
+            // scan root (prevents following symlinks into /proc, network
+            // mounts, or arbitrary places that would balloon the scan).
+            match std::fs::metadata(&path) {
+                Ok(target) if target.is_dir() && target.dev() == root_dev => {
+                    subdirs.push(Node::new(path, true, 0, modified, mode));
+                }
+                _ => {
+                    let size = meta.len();
+                    leaves.push(Node::new(path, false, size, modified, mode));
+                }
+            }
         } else if meta.is_dir() {
             subdirs.push(Node::new(path, true, 0, modified, mode));
         } else if meta.is_file() {
@@ -204,14 +239,16 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         }
     }
 
-    // Recurse into subdirs. For directories with very few children parallel
-    // dispatch is pure overhead, so we only fan out into rayon when there are
-    // enough siblings to make scheduling worthwhile.
+    // Recurse into subdirs. Only fan out into rayon at the top two levels
+    // (depth 0 and 1) — deeper levels run serially to avoid spawning a
+    // worker per directory in deep trees, which causes scheduling overhead
+    // to dominate the actual IO work.
     let warn_box: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    if subdirs.len() > 4 {
+    let parallel = depth <= 1 && subdirs.len() > 4;
+    if parallel {
         subdirs.par_iter_mut().for_each(|child| {
             let mut local = Vec::new();
-            build_dir(child, opts, &mut local);
+            build_dir(child, opts, &mut local, depth + 1, root_dev);
             if !local.is_empty() {
                 warn_box.lock().unwrap().extend(local);
             }
@@ -219,7 +256,7 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
     } else {
         for child in subdirs.iter_mut() {
             let mut local = Vec::new();
-            build_dir(child, opts, &mut local);
+            build_dir(child, opts, &mut local, depth + 1, root_dev);
             if !local.is_empty() {
                 warn_box.lock().unwrap().extend(local);
             }

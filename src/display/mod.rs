@@ -174,6 +174,7 @@ pub fn sort_nodes<'a>(nodes: &mut Vec<&'a Node>, sort: crate::cli::SortBy, order
 }
 
 /// A flat row produced by a renderer with metadata for TUI navigation.
+#[derive(Clone)]
 pub struct Row {
     pub line: Line<'static>,
     /// Path of the entry this row represents (for navigation), if any.

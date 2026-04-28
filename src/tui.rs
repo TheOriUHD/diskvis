@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -172,6 +175,41 @@ pub struct App {
     /// Set when the user requests application exit (e.g. clicks the [✕]
     /// title-bar button). Polled by the run loop.
     pub should_quit: bool,
+    /// Memoized row list keyed by a hash of every input that affects the
+    /// rendered rows. Rebuilt on cache miss; reused otherwise so common UI
+    /// paths (drawing, navigation, status updates) never repeat the renderer.
+    cached_rows: RefCell<Option<(u64, Vec<Row>)>>,
+    /// Memoized treemap buffer keyed on (root identity, render opts, area).
+    /// Avoids re-running the binary-split layout on every redraw.
+    treemap_cache: RefCell<Option<TreemapCache>>,
+    /// In-flight background scan, if any. UI stays interactive while a scan
+    /// runs; results are drained at the top of the run loop.
+    scan_rx: Option<Receiver<ScanMsg>>,
+    /// Target path of the in-flight scan (for status display + cache write).
+    scan_target: Option<PathBuf>,
+    /// Per-directory cache of recent scan results. Lets re-navigation feel
+    /// instant while a fresh scan runs in the background.
+    scan_cache: HashMap<PathBuf, ScanCacheEntry>,
+}
+
+/// One scan result delivered by a background walker thread.
+struct ScanMsg {
+    target: PathBuf,
+    result: std::io::Result<walker::ScanResult>,
+}
+
+#[derive(Clone)]
+struct ScanCacheEntry {
+    root: Node,
+    warnings: Vec<String>,
+    at: Instant,
+}
+
+struct TreemapCache {
+    key: u64,
+    width: u16,
+    height: u16,
+    buf: ratatui::buffer::Buffer,
 }
 
 #[derive(Clone)]
@@ -395,6 +433,11 @@ impl App {
             editor: None,
             new_item: None,
             should_quit: false,
+            cached_rows: RefCell::new(None),
+            treemap_cache: RefCell::new(None),
+            scan_rx: None,
+            scan_target: None,
+            scan_cache: HashMap::new(),
         }
     }
 
@@ -417,13 +460,111 @@ impl App {
     }
 
     fn build_rows(&self) -> Vec<Row> {
+        let key = self.compute_cache_key();
+        if let Some((k, rows)) = self.cached_rows.borrow().as_ref() {
+            if *k == key {
+                return rows.clone();
+            }
+        }
         let opts = self.render_opts();
         let raw = match self.config.mode {
             Mode::Tree => display::tree::render(&self.root, &opts),
             Mode::Bars => display::bars::render(&self.root, &opts),
             Mode::Treemap => display::treemap::render(&self.root, &opts),
         };
-        self.filter_rows(raw)
+        let rows = self.filter_rows(raw);
+        *self.cached_rows.borrow_mut() = Some((key, rows.clone()));
+        rows
+    }
+
+    /// Build a hash that captures every input affecting `build_rows()`. When
+    /// the hash matches the cached value, the prior `Vec<Row>` is reused
+    /// verbatim. The root is identified by its path + total size + child
+    /// count + modified time so we don't have to deep-hash the tree.
+    fn compute_cache_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.root.path.hash(&mut h);
+        self.root.size.hash(&mut h);
+        self.root.children.len().hash(&mut h);
+        if let Some(t) = self.root.modified.as_ref() {
+            if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                d.as_nanos().hash(&mut h);
+            }
+        }
+        (self.config.mode as u8).hash(&mut h);
+        (self.config.theme as u8).hash(&mut h);
+        self.config.depth.hash(&mut h);
+        self.config.show_files.hash(&mut h);
+        self.config.show_modified.hash(&mut h);
+        self.config.view.show_hidden.hash(&mut h);
+        self.config.view.show_empty.hash(&mut h);
+        self.config.view.show_percent.hash(&mut h);
+        self.config.view.show_modified.hash(&mut h);
+        (self.config.sort as u8).hash(&mut h);
+        (self.config.sort_order as u8).hash(&mut h);
+        self.min_size.hash(&mut h);
+        self.last_size.0.hash(&mut h);
+        self.last_size.1.hash(&mut h);
+        self.filter.query.hash(&mut h);
+        self.filter.active.hash(&mut h);
+        for ex in self.config.excludes.iter() {
+            ex.hash(&mut h);
+        }
+        for on in self.config.excludes_enabled.iter() {
+            on.hash(&mut h);
+        }
+        for ex in self.session_excludes.iter() {
+            ex.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Drop the row + treemap caches. Call after any state change that
+    /// could not be captured by `compute_cache_key`.
+    fn invalidate_caches(&self) {
+        self.cached_rows.borrow_mut().take();
+        self.treemap_cache.borrow_mut().take();
+    }
+
+    /// Render the treemap into `dst` at `area`, reusing a memoized buffer
+    /// when nothing the renderer cares about has changed. The treemap
+    /// algorithm is O(n log n) per call; this collapses repeated renders
+    /// (status bar updates, filter typing, cursor moves elsewhere on
+    /// screen) to a cheap blit.
+    fn draw_treemap_into(&self, area: Rect, dst: &mut ratatui::buffer::Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let key = self.compute_cache_key();
+        let mut cache = self.treemap_cache.borrow_mut();
+        let stale = match cache.as_ref() {
+            Some(c) => c.key != key || c.width != area.width || c.height != area.height,
+            None => true,
+        };
+        if stale {
+            let render_area = Rect::new(0, 0, area.width, area.height);
+            let mut buf = ratatui::buffer::Buffer::empty(render_area);
+            let opts = self.render_opts();
+            display::treemap::render_treemap(&self.root, &opts, render_area, &mut buf);
+            *cache = Some(TreemapCache {
+                key,
+                width: area.width,
+                height: area.height,
+                buf,
+            });
+        }
+        let entry = cache.as_ref().expect("just set");
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let src_pos = (x, y);
+                let dst_pos = (area.x + x, area.y + y);
+                if let Some(s) = entry.buf.cell(src_pos) {
+                    if let Some(d) = dst.cell_mut(dst_pos) {
+                        *d = s.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Number of selectable rows in the currently rendered view. The
@@ -635,26 +776,143 @@ impl App {
             self.flash(format!("not a directory: {}", path.display()));
             return;
         }
-        self.rescanning = true;
+
+        // Smart cache hit: if we scanned this directory recently, swap it in
+        // synchronously so navigation feels instant. Stale-while-revalidate:
+        // a fresh background scan still kicks off below.
+        let same_root = self.root.path == path;
+        let mut used_cache = false;
+        if !same_root {
+            if let Some(entry) = self.scan_cache.get(&path).cloned() {
+                if entry.at.elapsed() < Duration::from_secs(30) {
+                    self.root = entry.root;
+                    self.warnings = entry.warnings;
+                    self.warnings_scroll = 0;
+                    self.cursor = 0;
+                    self.scroll = 0;
+                    self.invalidate_caches();
+                    used_cache = true;
+                }
+            }
+        }
+
+        // No usable cache *and* navigating to a different directory: install
+        // a placeholder so the UI can repaint immediately while the real
+        // scan runs on a worker thread. When refreshing the *current* root
+        // we keep showing the existing tree until the new scan completes.
+        if !used_cache && !same_root {
+            self.root = walker::Node::placeholder(path.clone());
+            self.warnings.clear();
+            self.warnings_scroll = 0;
+            self.cursor = 0;
+            self.scroll = 0;
+            self.invalidate_caches();
+        }
+
+        self.start_background_scan(path);
+    }
+
+    /// Kick off a background walker thread for `path`. The result is sent
+    /// over `scan_rx` and consumed in `drain_scan_results`.
+    fn start_background_scan(&mut self, path: PathBuf) {
         let mut excludes = self.config.active_excludes();
         excludes.extend(self.session_excludes.iter().cloned());
-        let opts = WalkOptions {
-            excludes: &excludes,
-            on_progress: None,
+        let (tx, rx) = mpsc::channel::<ScanMsg>();
+        self.scan_rx = Some(rx);
+        self.scan_target = Some(path.clone());
+        self.rescanning = true;
+        let scan_path = path.clone();
+        thread::spawn(move || {
+            // Lower this thread's priority so the UI stays buttery even on
+            // a heavily-loaded box. Failure is non-fatal (we may not have
+            // CAP_SYS_NICE; the call simply returns -1).
+            #[cfg(unix)]
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+            let opts = WalkOptions {
+                excludes: &excludes,
+                on_progress: None,
+            };
+            let result = walker::build_tree(&scan_path, &opts);
+            let _ = tx.send(ScanMsg {
+                target: scan_path,
+                result,
+            });
+        });
+    }
+
+    /// Poll the in-flight scan channel and apply any completed result.
+    /// Returns `true` if a result was applied (caller may want to redraw).
+    fn drain_scan_results(&mut self) -> bool {
+        let Some(rx) = self.scan_rx.as_ref() else {
+            return false;
         };
-        match walker::build_tree(&path, &opts) {
+        let msg = match rx.try_recv() {
+            Ok(m) => m,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.scan_rx = None;
+                self.scan_target = None;
+                self.rescanning = false;
+                return false;
+            }
+        };
+        self.scan_rx = None;
+        self.scan_target = None;
+        self.rescanning = false;
+        match msg.result {
             Ok(scan) => {
-                self.root = scan.root;
-                self.warnings = scan.warnings;
-                self.warnings_scroll = 0;
-                self.cursor = 0;
-                self.scroll = 0;
+                // Only swap if the user is still looking at the same root —
+                // otherwise the scan was superseded by a navigation event
+                // and we keep the cache update but discard the swap.
+                let same_root = self.root.path == msg.target;
+                self.scan_cache.insert(
+                    msg.target.clone(),
+                    ScanCacheEntry {
+                        root: scan.root.clone(),
+                        warnings: scan.warnings.clone(),
+                        at: Instant::now(),
+                    },
+                );
+                self.evict_scan_cache();
+                if same_root {
+                    self.root = scan.root;
+                    self.warnings = scan.warnings;
+                    self.warnings_scroll = 0;
+                    let rows = self.build_rows();
+                    let last = App::last_selectable_idx(&rows);
+                    if self.cursor > last {
+                        self.cursor = last;
+                    }
+                    self.invalidate_caches();
+                }
+                true
             }
             Err(e) => {
                 self.status_msg = Some((format!("scan error: {}", e), Instant::now()));
+                false
             }
         }
-        self.rescanning = false;
+    }
+
+    /// Drop scan-cache entries older than 5 minutes, and trim to 50 entries
+    /// (keeping the most recent) when the map grows past the cap.
+    fn evict_scan_cache(&mut self) {
+        const MAX_AGE: Duration = Duration::from_secs(5 * 60);
+        const MAX_ENTRIES: usize = 50;
+        self.scan_cache.retain(|_, e| e.at.elapsed() < MAX_AGE);
+        if self.scan_cache.len() > MAX_ENTRIES {
+            let mut entries: Vec<(PathBuf, Instant)> = self
+                .scan_cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.at))
+                .collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let keep: std::collections::HashSet<PathBuf> =
+                entries.into_iter().take(MAX_ENTRIES).map(|(k, _)| k).collect();
+            self.scan_cache.retain(|k, _| keep.contains(k));
+        }
     }
 
     fn drill_into(&mut self, path: PathBuf) {
@@ -1097,6 +1355,8 @@ fn run_loop<B: ratatui::backend::Backend>(
         if app.spotlight.is_some() {
             app.spotlight_refresh(false);
         }
+        // Apply any completed background scan before drawing.
+        app.drain_scan_results();
 
         terminal.draw(|f| {
             let size = f.area();
@@ -1104,7 +1364,13 @@ fn run_loop<B: ratatui::backend::Backend>(
             draw(f, app, size);
         })?;
 
-        let poll_ms = if app.spotlight.is_some() { 30 } else { 200 };
+        let poll_ms = if app.spotlight.is_some() {
+            30
+        } else if app.rescanning {
+            80
+        } else {
+            200
+        };
         if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -1326,6 +1592,9 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('~') => app.jump_home(),
         KeyCode::Char('r') => {
             let cur = app.root.path.clone();
+            // Explicit rescan: drop any cached scan for this path so the
+            // worker re-walks the filesystem instead of seeing a fresh hit.
+            app.scan_cache.clear();
             app.rescan_at(cur);
             app.flash("rescanned");
         }
@@ -2003,8 +2272,7 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     if app.config.mode == Mode::Treemap {
         app.body_visible_rows = area.height as usize;
         app.body_scroll = 0;
-        let opts = app.render_opts();
-        display::treemap::render_treemap(&app.root, &opts, area, f.buffer_mut());
+        app.draw_treemap_into(area, f.buffer_mut());
         return;
     }
 
@@ -2209,7 +2477,22 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     };
 
     let msg_override = if app.rescanning {
-        Some("Scanning…".to_string())
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let ticks = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() / 90)
+            .unwrap_or(0) as usize;
+        let frame = FRAMES[ticks % FRAMES.len()];
+        let target = app
+            .scan_target
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if target.is_empty() {
+            Some(format!("{} Scanning…", frame))
+        } else {
+            Some(format!("{} Scanning {}", frame, target))
+        }
     } else if let Some((msg, t)) = &app.status_msg {
         if t.elapsed() < Duration::from_secs(3) {
             Some(msg.clone())

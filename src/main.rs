@@ -22,6 +22,12 @@ use crate::walker::WalkOptions;
 
 fn main() {
     human_panic::setup_panic!();
+    // Slight UI priority boost. Best-effort: requires CAP_SYS_NICE for
+    // negative values; a failure simply leaves us at the default niceness.
+    #[cfg(unix)]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, -5);
+    }
     let cli = Cli::parse();
 
     if cli.no_color {

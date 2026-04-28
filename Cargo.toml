@@ -27,6 +27,7 @@ dirs = "5"
 rayon = "1"
 users = "0.11"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+libc = "0.2"
 
 [package.metadata.deb]
 maintainer = "TheOriUHD <theoriuhd@users.noreply.github.com>"
