@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -15,6 +16,9 @@ pub struct Node {
     pub is_dir: bool,
     #[serde(serialize_with = "serialize_modified", skip_serializing_if = "Option::is_none")]
     pub modified: Option<SystemTime>,
+    /// Unix permission bits (lower 12 bits significant: rwx + setuid/setgid/sticky).
+    /// Populated when scanning so renderers can flag unusual perms.
+    pub mode: Option<u32>,
     pub children: Vec<Node>,
 }
 
@@ -36,7 +40,13 @@ fn serialize_modified<S: serde::Serializer>(
 }
 
 impl Node {
-    fn new(path: PathBuf, is_dir: bool, size: u64, modified: Option<SystemTime>) -> Self {
+    fn new(
+        path: PathBuf,
+        is_dir: bool,
+        size: u64,
+        modified: Option<SystemTime>,
+        mode: Option<u32>,
+    ) -> Self {
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -47,8 +57,17 @@ impl Node {
             size,
             is_dir,
             modified,
+            mode,
             children: Vec::new(),
         }
+    }
+
+    /// Returns true when the node carries permission bits that warrant a
+    /// visual highlight (world-writable file/dir, or setuid/setgid).
+    pub fn has_unusual_perms(&self) -> bool {
+        let Some(m) = self.mode else { return false };
+        // world-writable: o+w. SUID / SGID bits.
+        m & 0o002 != 0 || m & 0o4000 != 0 || m & 0o2000 != 0
     }
 
     pub fn file_count(&self) -> usize {
@@ -92,102 +111,10 @@ pub struct WalkOptions<'a> {
     pub on_progress: Option<&'a (dyn Fn(&Path) + Sync)>,
 }
 
-/// Default platform-specific virtual-filesystem excludes (absolute paths).
-/// On Unix these are pseudo-filesystems that should not be traversed by
-/// default; on Windows there is no equivalent.
-#[cfg(unix)]
+/// Default virtual-filesystem excludes (absolute paths). These are
+/// pseudo-filesystems that should not be traversed by default.
 pub fn vfs_excludes() -> Vec<&'static str> {
     vec!["/proc", "/sys", "/dev", "/run", "/tmp"]
-}
-
-#[cfg(windows)]
-pub fn vfs_excludes() -> Vec<&'static str> {
-    // Windows system folders that cause permission spam or are uninteresting.
-    // Matched by basename (no leading slash) so they apply at any depth.
-    vec![
-        "$RECYCLE.BIN",
-        "System Volume Information",
-        "WindowsApps",
-        "WpSystem",
-        "Recovery",
-        "Config.Msi",
-    ]
-}
-
-#[cfg(not(any(unix, windows)))]
-pub fn vfs_excludes() -> Vec<&'static str> {
-    vec![]
-}
-
-/// On Windows, enumerate available drive letters by probing `A:\`..`Z:\`.
-/// Returns the drive root as a `PathBuf` (e.g. `C:\`).
-#[cfg(windows)]
-pub fn enumerate_drives() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for letter in b'A'..=b'Z' {
-        let p = PathBuf::from(format!("{}:\\", letter as char));
-        if p.exists() {
-            out.push(p);
-        }
-    }
-    out
-}
-
-/// Sentinel path representing the synthetic Windows "This PC" root.
-#[cfg(windows)]
-pub fn this_pc_sentinel() -> PathBuf {
-    PathBuf::from(r"\\?\ThisPC")
-}
-
-/// Build a synthetic [`Node`] tree representing "This PC" — a virtual root
-/// whose children are each available drive (Windows-only). Each drive's
-/// `size` is its used bytes (total − free); free space is appended to the
-/// drive's display name so renderers surface it.
-#[cfg(windows)]
-pub fn build_this_pc_node() -> Node {
-    use fs2::{free_space, total_space};
-    let drives = enumerate_drives();
-    let children: Vec<Node> = drives
-        .into_iter()
-        .map(|p| {
-            let total = total_space(&p).unwrap_or(0);
-            let free = free_space(&p).unwrap_or(0);
-            let used = total.saturating_sub(free);
-            let label = p.to_string_lossy().into_owned();
-            let name = if total > 0 {
-                format!(
-                    "{}  (free: {} / {})",
-                    label,
-                    crate::display::human_size(free),
-                    crate::display::human_size(total),
-                )
-            } else {
-                label
-            };
-            Node {
-                path: p,
-                name,
-                size: used,
-                is_dir: true,
-                modified: None,
-                children: Vec::new(),
-            }
-        })
-        .collect();
-    let total: u64 = children.iter().map(|c| c.size).sum();
-    Node {
-        path: this_pc_sentinel(),
-        name: "This PC".to_string(),
-        size: total,
-        is_dir: true,
-        modified: None,
-        children,
-    }
-}
-
-#[cfg(windows)]
-pub fn is_this_pc(p: &Path) -> bool {
-    p == this_pc_sentinel().as_path()
 }
 
 pub struct ScanResult {
@@ -200,6 +127,7 @@ pub struct ScanResult {
 
 pub fn build_tree(root: &Path, opts: &WalkOptions) -> std::io::Result<ScanResult> {
     let meta = std::fs::symlink_metadata(root)?;
+    let mode = Some(meta.mode());
     if !meta.is_dir() {
         return Ok(ScanResult {
             root: Node::new(
@@ -207,11 +135,12 @@ pub fn build_tree(root: &Path, opts: &WalkOptions) -> std::io::Result<ScanResult
                 false,
                 meta.len(),
                 meta.modified().ok(),
+                mode,
             ),
             warnings: Vec::new(),
         });
     }
-    let mut node = Node::new(root.to_path_buf(), true, 0, meta.modified().ok());
+    let mut node = Node::new(root.to_path_buf(), true, 0, meta.modified().ok(), mode);
     let mut warnings = Vec::new();
     build_dir(&mut node, opts, &mut warnings);
     Ok(ScanResult {
@@ -260,15 +189,16 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         };
 
         let modified = meta.modified().ok();
+        let mode = Some(meta.mode());
 
         if meta.file_type().is_symlink() {
             let size = meta.len();
-            leaves.push(Node::new(path, false, size, modified));
+            leaves.push(Node::new(path, false, size, modified, mode));
         } else if meta.is_dir() {
-            subdirs.push(Node::new(path, true, 0, modified));
+            subdirs.push(Node::new(path, true, 0, modified, mode));
         } else if meta.is_file() {
             let size = meta.len();
-            leaves.push(Node::new(path, false, size, modified));
+            leaves.push(Node::new(path, false, size, modified, mode));
         }
     }
 

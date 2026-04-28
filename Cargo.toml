@@ -25,9 +25,8 @@ toml = "0.8"
 arboard = "3"
 dirs = "5"
 rayon = "1"
-
-[target.'cfg(windows)'.dependencies]
-fs2 = "0.4"
+users = "0.11"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [package.metadata.deb]
 maintainer = "TheOriUHD <theoriuhd@users.noreply.github.com>"

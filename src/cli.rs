@@ -82,7 +82,7 @@ pub struct Cli {
     #[arg(long = "modified")]
     pub modified: bool,
 
-    /// Print warnings and non-fatal errors to stderr (default on Unix; required on Windows)
+    /// Print warnings and non-fatal errors to stderr
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 }

@@ -114,6 +114,7 @@ pub fn render(root: &Node, opts: &RenderOptions) -> Vec<Row> {
                     size: *size,
                     is_dir: false,
                     modified: None,
+                    mode: None,
                     children: Vec::new(),
                 };
                 (&synthetic, true)

@@ -255,7 +255,12 @@ fn style_to_ansi(style: Style) -> String {
 }
 
 pub fn name_span(node: &Node, theme: Theme) -> Span<'static> {
-    let style = if node.is_dir {
+    let style = if node.has_unusual_perms() {
+        // Orange overlay for SUID / SGID / world-writable entries.
+        Style::default()
+            .fg(Color::Rgb(255, 140, 0))
+            .add_modifier(Modifier::BOLD)
+    } else if node.is_dir {
         dir_style(theme)
     } else {
         file_style(theme)

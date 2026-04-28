@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod display;
+mod editor;
 mod tui;
 mod walker;
 
@@ -35,14 +36,6 @@ fn main() {
         process::exit(1);
     }
 
-    // On Windows, with no explicit path argument, default to the synthetic
-    // "This PC" root so the user starts at the drive picker.
-    #[cfg(windows)]
-    let force_this_pc = cli.path == std::path::Path::new(".");
-    #[cfg(not(windows))]
-    let force_this_pc = false;
-
-    // Build effective config: load file, then override with CLI flags.
     let mut cfg = Config::load();
     if let Some(d) = cli.depth {
         cfg.depth = d;
@@ -104,30 +97,16 @@ fn main() {
         on_progress: Some(&on_progress),
     };
 
-    let scan = if force_this_pc {
-        #[cfg(windows)]
-        {
-            crate::walker::ScanResult {
-                root: crate::walker::build_this_pc_node(),
-                warnings: Vec::new(),
+    let scan = match walker::build_tree(&path, &opts) {
+        Ok(n) => n,
+        Err(e) => {
+            if let Some(pb) = pb.as_ref() {
+                pb.finish_and_clear();
             }
-        }
-        #[cfg(not(windows))]
-        {
-            unreachable!()
-        }
-    } else {
-        match walker::build_tree(&path, &opts) {
-            Ok(n) => n,
-            Err(e) => {
-                if let Some(pb) = pb.as_ref() {
-                    pb.finish_and_clear();
-                }
-                if should_log_stderr(cli.verbose) {
-                    eprintln!("error: {}", e);
-                }
-                process::exit(1);
+            if should_log_stderr(cli.verbose) {
+                eprintln!("error: {}", e);
             }
+            process::exit(1);
         }
     };
     let root = scan.root;
@@ -207,21 +186,9 @@ fn main() {
 }
 
 /// Whether non-fatal warnings/errors should be written to stderr.
-///
-/// On Windows the stderr stream from a console app often surfaces in the
-/// debug console / parent shell in unexpected ways, so we suppress it by
-/// default and require an explicit `--verbose` flag. On other platforms
-/// stderr is always logged.
 fn should_log_stderr(verbose: bool) -> bool {
-    #[cfg(windows)]
-    {
-        verbose
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = verbose;
-        true
-    }
+    let _ = verbose;
+    true
 }
 
 fn term_width() -> u16 {

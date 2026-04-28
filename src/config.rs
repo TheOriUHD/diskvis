@@ -117,10 +117,7 @@ impl Config {
                         return cfg;
                     }
                     Err(e) => {
-                        #[cfg(not(windows))]
                         eprintln!("warning: failed to parse config: {}", e);
-                        #[cfg(windows)]
-                        let _ = e;
                     }
                 }
             }

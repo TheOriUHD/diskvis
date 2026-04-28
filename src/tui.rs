@@ -1,4 +1,5 @@
 use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -23,62 +24,17 @@ use ratatui::Terminal;
 use crate::cli::{Mode, SortBy, SortOrder};
 use crate::config::{Config, Theme};
 use crate::display::{self, RenderOptions, Row};
+use crate::editor::{Editor, EditorOutcome, EditorPrompt};
 use crate::walker::{self, Node, WalkOptions};
 
-/// Strip the Windows `\\?\` extended-length path prefix from a path's
-/// display string. This prefix is an internal NT-namespace marker that
-/// should never appear in user-facing output. Also rewrites the synthetic
-/// `\\?\ThisPC` sentinel to the friendly label `This PC`.
+/// Display a path as a string. Unix paths are returned verbatim.
 fn display_path(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    if s == "\\\\?\\ThisPC" {
-        return "This PC".to_string();
-    }
-    if let Some(rest) = s.strip_prefix("\\\\?\\") {
-        return rest.to_string();
-    }
-    s.into_owned()
+    p.to_string_lossy().into_owned()
 }
 
-/// Render the navigation breadcrumb for the current root, e.g.
-/// `This PC › C:\ › Users › Philipp`. On Unix this collapses to a
-/// regular `/`-separated path with the leading `/` shown as `/`.
+/// Render the navigation breadcrumb for the current root.
 fn breadcrumb(p: &Path) -> String {
-    let display = display_path(p);
-    #[cfg(windows)]
-    {
-        // Walk components, prefixing with "This PC" so users always know
-        // where they are in the hierarchy.
-        if display == "This PC" {
-            return "This PC".to_string();
-        }
-        let mut parts: Vec<String> = vec!["This PC".to_string()];
-        let mut iter = std::path::Path::new(&display).components().peekable();
-        while let Some(c) = iter.next() {
-            match c {
-                std::path::Component::Prefix(p) => {
-                    let mut s = p.as_os_str().to_string_lossy().into_owned();
-                    // Drive prefix becomes `C:\`.
-                    if matches!(iter.peek(), Some(std::path::Component::RootDir)) {
-                        s.push('\\');
-                        iter.next();
-                    }
-                    parts.push(s);
-                }
-                std::path::Component::RootDir => {}
-                std::path::Component::Normal(n) => {
-                    parts.push(n.to_string_lossy().into_owned());
-                }
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => parts.push("..".to_string()),
-            }
-        }
-        return parts.join("  ›  ");
-    }
-    #[cfg(not(windows))]
-    {
-        display
-    }
+    display_path(p)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -87,6 +43,8 @@ enum View {
     Settings,
     Help,
     Warnings,
+    Permissions,
+    Editor,
 }
 
 #[derive(Clone, Default)]
@@ -202,6 +160,10 @@ pub struct App {
     pub spotlight: Option<SpotlightState>,
     spot_tx: Option<Sender<SpotlightReq>>,
     spot_rx: Option<Receiver<SpotlightResp>>,
+    /// Permissions inspector state (when active).
+    pub perms: Option<PermsState>,
+    /// Embedded text editor (when active).
+    pub editor: Option<Editor>,
     /// Set when the user requests application exit (e.g. clicks the [✕]
     /// title-bar button). Polled by the run loop.
     pub should_quit: bool,
@@ -227,6 +189,116 @@ enum SettingKind {
     ResetDefaults,
 }
 
+/// State for the permissions inspector overlay.
+pub struct PermsState {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub uid: u32,
+    pub gid: u32,
+    pub owner_name: String,
+    pub group_name: String,
+    /// Lower 12 bits: rwx triplets and special bits.
+    pub mode: u32,
+    /// Cursor across the toggle/button grid. See [`PermsState::CELLS`].
+    pub cursor: usize,
+    /// Confirmation overlay for "Apply Recursively".
+    pub confirm_recursive: bool,
+    /// Confirm-cursor: 0=Yes, 1=No.
+    pub confirm_cursor: u8,
+}
+
+impl PermsState {
+    /// 9 perm toggles (rwx for owner/group/other) + 3 special bits + 3 buttons = 15.
+    #[allow(dead_code)]
+    pub const CELLS: usize = 15;
+
+    pub fn from_path(path: &Path) -> Result<Self, String> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        let mode = meta.permissions().mode();
+        let uid = meta.uid();
+        let gid = meta.gid();
+        let owner_name = users::get_user_by_uid(uid)
+            .map(|u| u.name().to_string_lossy().into_owned())
+            .unwrap_or_else(|| uid.to_string());
+        let group_name = users::get_group_by_gid(gid)
+            .map(|g| g.name().to_string_lossy().into_owned())
+            .unwrap_or_else(|| gid.to_string());
+        Ok(PermsState {
+            path: path.to_path_buf(),
+            is_dir: meta.is_dir(),
+            uid,
+            gid,
+            owner_name,
+            group_name,
+            mode: mode & 0o7777,
+            cursor: 12, // default to [Apply]
+            confirm_recursive: false,
+            confirm_cursor: 1,
+        })
+    }
+
+    /// Apply the current `mode` to `path` (non-recursive).
+    pub fn apply(&self) -> std::io::Result<()> {
+        std::fs::set_permissions(
+            &self.path,
+            std::fs::Permissions::from_mode(self.mode),
+        )
+    }
+
+    /// Walk the tree, applying `mode` to every entry.
+    pub fn apply_recursive(&self) -> Result<usize, String> {
+        let mut count = 0usize;
+        for entry in walkdir::WalkDir::new(&self.path) {
+            let entry =
+                entry.map_err(|e| format!("walk error: {}", e))?;
+            let p = entry.path();
+            if let Err(e) = std::fs::set_permissions(
+                p,
+                std::fs::Permissions::from_mode(self.mode),
+            ) {
+                return Err(format!("{}: {}", p.display(), e));
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Toggle the cell under the cursor (perms grid only).
+    pub fn toggle_cursor(&mut self) {
+        if self.cursor < 9 {
+            // owner/group/other rwx
+            let bit = 1u32 << (8 - self.cursor);
+            self.mode ^= bit;
+        } else if self.cursor < 12 {
+            // SUID / SGID / Sticky
+            let bit = match self.cursor {
+                9 => 0o4000,
+                10 => 0o2000,
+                11 => 0o1000,
+                _ => 0,
+            };
+            self.mode ^= bit;
+        }
+    }
+
+    pub fn move_cursor(&mut self, dx: i32, dy: i32) {
+        let idx = self.cursor as i32;
+        // Layout: 3 rows of 3 perm toggles (0..9), 1 row of 3 special bits
+        // (9..12), 1 row of 3 buttons (12..15).
+        let row = idx / 3;
+        let col = idx % 3;
+        let new_row = (row + dy).clamp(0, 4);
+        let new_col = (col + dx).clamp(0, 2);
+        let new_idx = (new_row * 3 + new_col).clamp(0, 14);
+        self.cursor = new_idx as usize;
+    }
+}
+
+pub fn is_root() -> bool {
+    users::get_current_uid() == 0
+}
+
 impl App {
     pub fn new(
         root: Node,
@@ -235,15 +307,6 @@ impl App {
         min_size: u64,
         warnings: Vec<String>,
     ) -> Self {
-        // On Windows, ensure "This PC" is always the bottom of the nav
-        // stack so the user can never navigate above it.
-        #[cfg(windows)]
-        let nav_stack: Vec<PathBuf> = if walker::is_this_pc(&root.path) {
-            Vec::new()
-        } else {
-            vec![walker::this_pc_sentinel()]
-        };
-        #[cfg(not(windows))]
         let nav_stack: Vec<PathBuf> = Vec::new();
 
         Self {
@@ -272,6 +335,8 @@ impl App {
             spotlight: None,
             spot_tx: None,
             spot_rx: None,
+            perms: None,
+            editor: None,
             should_quit: false,
         }
     }
@@ -471,20 +536,6 @@ impl App {
             });
         }
         for (i, pat) in self.config.excludes.iter().enumerate() {
-            #[cfg(windows)]
-            {
-                // Linux pseudo-filesystem excludes have no analog on Windows.
-                if matches!(
-                    pat.as_str(),
-                    "/proc" | "/sys" | "/dev" | "/run" | "/tmp"
-                ) {
-                    continue;
-                }
-                // Hide any other absolute Unix-style path entries.
-                if pat.starts_with('/') {
-                    continue;
-                }
-            }
             let on = self.config.excludes_enabled.get(i).copied().unwrap_or(true);
             items.push(SettingItem {
                 label: format!("Exclude  [{}]  {}", if on { "x" } else { " " }, pat),
@@ -508,18 +559,6 @@ impl App {
 
     fn rescan_at(&mut self, path: PathBuf) {
         self.rescanning = true;
-        #[cfg(windows)]
-        {
-            if walker::is_this_pc(&path) {
-                self.root = walker::build_this_pc_node();
-                self.warnings.clear();
-                self.warnings_scroll = 0;
-                self.cursor = 0;
-                self.scroll = 0;
-                self.rescanning = false;
-                return;
-            }
-        }
         let mut excludes = self.config.active_excludes();
         excludes.extend(self.session_excludes.iter().cloned());
         let opts = WalkOptions {
@@ -547,33 +586,10 @@ impl App {
     }
 
     fn go_up(&mut self) {
-        // On Windows, the nav stack is seeded with "This PC" so the user
-        // can never go above it. On Unix, allow climbing all the way to /.
-        #[cfg(windows)]
-        {
-            if walker::is_this_pc(&self.root.path) {
-                return;
-            }
-        }
         if let Some(prev) = self.nav_stack.pop() {
             self.rescan_at(prev);
         } else if let Some(parent) = self.root.path.parent().map(|p| p.to_path_buf()) {
-            #[cfg(windows)]
-            {
-                // Reaching above a drive letter on Windows lands in This PC.
-                if parent.as_os_str().is_empty() || parent.parent().is_none() {
-                    self.rescan_at(walker::this_pc_sentinel());
-                    return;
-                }
-            }
             self.rescan_at(parent);
-        } else {
-            #[cfg(windows)]
-            {
-                if !walker::is_this_pc(&self.root.path) {
-                    self.rescan_at(walker::this_pc_sentinel());
-                }
-            }
         }
     }
 
@@ -630,9 +646,7 @@ impl App {
         let opener: &str = "xdg-open";
         #[cfg(target_os = "macos")]
         let opener: &str = "open";
-        #[cfg(target_os = "windows")]
-        let opener: &str = "explorer";
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let opener: &str = "xdg-open";
 
         match Command::new(opener)
@@ -666,6 +680,38 @@ impl App {
         if let Some(home) = dirs::home_dir() {
             self.nav_stack.push(self.root.path.clone());
             self.rescan_at(home);
+        }
+    }
+
+    fn open_perms_inspector(&mut self) {
+        let Some(p) = self.selected_row_path() else {
+            self.flash("nothing selected");
+            return;
+        };
+        match PermsState::from_path(&p) {
+            Ok(state) => {
+                self.perms = Some(state);
+                self.view = View::Permissions;
+            }
+            Err(e) => self.flash(format!("perms: {}", e)),
+        }
+    }
+
+    fn open_editor_for_selected(&mut self) {
+        let Some(p) = self.selected_row_path() else {
+            self.flash("nothing selected");
+            return;
+        };
+        if p.is_dir() {
+            self.flash("editor: cannot open a directory");
+            return;
+        }
+        match Editor::open(p) {
+            Ok(ed) => {
+                self.editor = Some(ed);
+                self.view = View::Editor;
+            }
+            Err(e) => self.flash(format!("editor: {}", e)),
         }
     }
 
@@ -704,17 +750,6 @@ impl App {
 
     fn open_spotlight(&mut self) {
         self.ensure_spotlight_worker();
-        #[cfg(windows)]
-        let init = if walker::is_this_pc(&self.root.path) {
-            String::new()
-        } else {
-            let mut s = display_path(&self.root.path);
-            if !s.ends_with('\\') && !s.ends_with('/') {
-                s.push('\\');
-            }
-            s
-        };
-        #[cfg(not(windows))]
         let init = {
             let s = format!("{}/", self.root.path.display());
             s.replace("//", "/")
@@ -805,21 +840,7 @@ impl App {
 fn split_input(input: &str) -> (PathBuf, String) {
     let expanded = expand_tilde(input);
     if expanded.is_empty() {
-        #[cfg(windows)]
-        {
-            return (walker::this_pc_sentinel(), String::new());
-        }
-        #[cfg(not(windows))]
-        {
-            return (PathBuf::from("/"), String::new());
-        }
-    }
-    #[cfg(windows)]
-    {
-        // Bare "/" on Windows: also surface drives.
-        if expanded == "/" || expanded == "\\" {
-            return (walker::this_pc_sentinel(), String::new());
-        }
+        return (PathBuf::from("/"), String::new());
     }
     if expanded.ends_with('/') {
         let trimmed = expanded.trim_end_matches('/');
@@ -865,21 +886,6 @@ fn expand_tilde(input: &str) -> String {
 
 fn list_dir_entries(parent: &Path, _partial: &str) -> Vec<SpotlightEntry> {
     let mut out: Vec<SpotlightEntry> = Vec::new();
-    #[cfg(windows)]
-    {
-        if walker::is_this_pc(parent) {
-            for drive in walker::enumerate_drives() {
-                let name = drive.to_string_lossy().into_owned();
-                out.push(SpotlightEntry {
-                    path: drive,
-                    name,
-                    is_dir: true,
-                    size_hint: None,
-                });
-            }
-            return out;
-        }
-    }
     let dir = if parent.as_os_str().is_empty() {
         Path::new("/")
     } else {
@@ -1019,6 +1025,25 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // Editor swallows all keys when open.
+    if app.editor.is_some() {
+        let outcome = {
+            let editor = app.editor.as_mut().unwrap();
+            editor.report_size(app.last_size.0, app.last_size.1);
+            editor.handle_key(key)
+        };
+        if outcome == EditorOutcome::Close {
+            app.editor = None;
+        }
+        return false;
+    }
+
+    // Permissions inspector swallows keys when open.
+    if app.perms.is_some() {
+        handle_perms_key(app, key);
+        return false;
+    }
+
     // Spotlight overlay swallows all keys when open.
     if app.spotlight.is_some() {
         handle_spotlight_key(app, key);
@@ -1054,6 +1079,11 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         View::Help => {
             // Any key closes help.
             app.view = View::Main;
+            return false;
+        }
+        View::Permissions | View::Editor => {
+            // Handled above via app.perms / app.editor branches; the View enum
+            // is purely a draw-state marker for these overlays.
             return false;
         }
         View::Warnings => {
@@ -1098,11 +1128,13 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             app.warnings_scroll = 0;
             app.view = View::Warnings;
         }
-        KeyCode::Char('e') => {
+        KeyCode::Char('e') => app.open_editor_for_selected(),
+        KeyCode::Char('S') => {
             app.settings_cursor = 0;
             app.settings_scroll = 0;
             app.view = View::Settings;
         }
+        KeyCode::Char('i') => app.open_perms_inspector(),
         KeyCode::Char(' ') => app.open_spotlight(),
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.open_spotlight();
@@ -1376,7 +1408,7 @@ fn spotlight_complete(app: &mut App) {
 }
 
 fn handle_settings_key(app: &mut App, key: KeyEvent) {    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('e') => {
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('S') => {
             app.save_settings();
             app.view = View::Main;
         }
@@ -1487,7 +1519,7 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
                     app.warnings_scroll = (app.warnings_scroll + 3)
                         .min(app.warnings.len().saturating_sub(1));
                 }
-                View::Help => {}
+                View::Help | View::Permissions | View::Editor => {}
             }
             return;
         }
@@ -1503,7 +1535,7 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
                 View::Warnings => {
                     app.warnings_scroll = app.warnings_scroll.saturating_sub(3);
                 }
-                View::Help => {}
+                View::Help | View::Permissions | View::Editor => {}
             }
             return;
         }
@@ -1690,6 +1722,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         View::Help => draw_help(f, area, app),
         View::Settings => draw_settings(f, area, app),
         View::Warnings => draw_warnings(f, area, app),
+        View::Permissions => draw_permissions(f, area, app),
+        View::Editor => draw_editor(f, area, app),
         View::Main => {}
     }
 
@@ -2261,7 +2295,9 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from("  x              exclude selected entry (session)"),
         Line::from("  o              open in system file manager (xdg-open)"),
         Line::from("  y              yank path to clipboard"),
-        Line::from("  e              settings panel"),
+        Line::from("  e              open file in editor"),
+        Line::from("  i              permission inspector"),
+        Line::from("  S              settings panel"),
         Line::from("  w              warnings overlay"),
         Line::from("  Space / Ctrl-P open path spotlight"),
         Line::from("  ?              this help"),
@@ -2302,19 +2338,7 @@ fn draw_settings(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             "Enter/Space: toggle  +/-: depth  PgUp/PgDn: scroll  q/Esc: close (saves)",
             Style::default().fg(Color::DarkGray),
         )),
-        Line::from({
-            #[cfg(windows)]
-            {
-                Span::styled(
-                    "Running on Windows",
-                    Style::default().fg(Color::Blue),
-                )
-            }
-            #[cfg(not(windows))]
-            {
-                Span::raw("")
-            }
-        }),
+        Line::from(""),
     ];
 
     let inner_x = popup.x + 1;
@@ -2545,5 +2569,504 @@ fn path_eq(a: Option<&Path>, b: Option<&Path>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => x == y,
         _ => false,
+    }
+}
+
+// ============================================================================
+// Permissions inspector
+// ============================================================================
+
+fn handle_perms_key(app: &mut App, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    // Confirm-recursive sub-modal first.
+    if let Some(state) = app.perms.as_mut() {
+        if state.confirm_recursive {
+            match key.code {
+                KeyCode::Esc => {
+                    state.confirm_recursive = false;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    state.confirm_cursor ^= 1;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let cursor = state.confirm_cursor;
+                    state.confirm_recursive = false;
+                    if cursor == 0 {
+                        // Yes -> apply recursively (root only).
+                        if !is_root() {
+                            app.flash("recursive apply requires sudo/root");
+                            return;
+                        }
+                        let s = app.perms.as_ref().unwrap().clone_apply_target();
+                        match s {
+                            Ok(_) => {
+                                let res = app.perms.as_ref().unwrap().apply_recursive();
+                                match res {
+                                    Ok(n) => app.flash(format!("applied to {} entries", n)),
+                                    Err(e) => app.flash(format!("apply failed: {}", e)),
+                                }
+                            }
+                            Err(e) => app.flash(e),
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
+            app.perms = None;
+            app.view = View::Main;
+        }
+        KeyCode::Left => {
+            if let Some(s) = app.perms.as_mut() {
+                s.move_cursor(-1, 0);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(s) = app.perms.as_mut() {
+                s.move_cursor(1, 0);
+            }
+        }
+        KeyCode::Up => {
+            if let Some(s) = app.perms.as_mut() {
+                s.move_cursor(0, -1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(s) = app.perms.as_mut() {
+                s.move_cursor(0, 1);
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(s) = app.perms.as_mut() {
+                if s.cursor < 12 {
+                    s.toggle_cursor();
+                } else {
+                    activate_perms_button(app);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(s) = app.perms.as_mut() {
+                if s.cursor < 12 {
+                    s.toggle_cursor();
+                } else {
+                    activate_perms_button(app);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn activate_perms_button(app: &mut App) {
+    let Some(state) = app.perms.as_ref() else {
+        return;
+    };
+    match state.cursor {
+        12 => {
+            // Apply
+            if !is_root() {
+                app.flash("apply requires sudo/root");
+                return;
+            }
+            match state.apply() {
+                Ok(()) => app.flash("permissions applied"),
+                Err(e) => app.flash(format!("apply failed: {}", e)),
+            }
+        }
+        13 => {
+            // Apply Recursively → confirm modal
+            if let Some(s) = app.perms.as_mut() {
+                s.confirm_recursive = true;
+                s.confirm_cursor = 1;
+            }
+        }
+        14 => {
+            // Cancel
+            app.perms = None;
+            app.view = View::Main;
+        }
+        _ => {}
+    }
+}
+
+impl PermsState {
+    /// Compatibility shim used by the recursive-apply path so callers can
+    /// uniformly produce a `Result` while we keep the `apply()` signature
+    /// stable.
+    pub fn clone_apply_target(&self) -> Result<(), String> {
+        if !self.path.exists() {
+            return Err(format!("path no longer exists: {}", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+fn draw_permissions(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(s) = app.perms.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(64, 60, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            format!(" Permissions: {} ", s.path.display()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  Owner: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} ({})", s.owner_name, s.uid),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("    "),
+        Span::styled("Group: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} ({})", s.group_name, s.gid),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Mode:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}  ({:o})", mode_string(s.mode, s.is_dir), s.mode),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // 3x3 grid of rwx toggles for owner / group / other.
+    let labels = ["Owner ", "Group ", "Other "];
+    for (row_idx, label) in labels.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled(*label, Style::default().fg(Color::Cyan)),
+        ];
+        for col_idx in 0..3 {
+            let cell = row_idx * 3 + col_idx;
+            let bit = 1u32 << (8 - cell);
+            let on = s.mode & bit != 0;
+            let ch = match col_idx {
+                0 => 'r',
+                1 => 'w',
+                _ => 'x',
+            };
+            let label_text = if on { format!("[{}]", ch) } else { "[ ]".to_string() };
+            let mut style = Style::default().fg(if on { Color::Green } else { Color::DarkGray });
+            if cell == s.cursor {
+                style = style.bg(Color::Rgb(40, 40, 70)).add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(label_text, style));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+
+    // Special bits row.
+    let specials = [
+        (0o4000u32, "SUID"),
+        (0o2000u32, "SGID"),
+        (0o1000u32, "Sticky"),
+    ];
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  Special  ")];
+    for (i, (bit, label)) in specials.iter().enumerate() {
+        let cell = 9 + i;
+        let on = s.mode & *bit != 0;
+        let text = if on {
+            format!("[x] {}  ", label)
+        } else {
+            format!("[ ] {}  ", label)
+        };
+        let mut style = Style::default().fg(if on { Color::Green } else { Color::DarkGray });
+        if cell == s.cursor {
+            style = style.bg(Color::Rgb(40, 40, 70)).add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(text, style));
+    }
+    lines.push(Line::from(spans));
+    lines.push(Line::from(""));
+
+    // Buttons row.
+    let root = is_root();
+    let buttons = [
+        (12usize, "[ Apply ]"),
+        (13usize, "[ Apply Recursively ]"),
+        (14usize, "[ Cancel ]"),
+    ];
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    for (cell, label) in buttons.iter() {
+        let active = *cell == s.cursor;
+        let disabled = !root && (*cell == 12 || *cell == 13);
+        let mut style = if disabled {
+            Style::default().fg(Color::DarkGray)
+        } else if *cell == 14 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        };
+        if active {
+            style = style.bg(Color::Rgb(40, 40, 70)).add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled((*label).to_string(), style));
+        spans.push(Span::raw("  "));
+    }
+    lines.push(Line::from(spans));
+    if !root {
+        lines.push(Line::from(Span::styled(
+            "  (Apply requires sudo/root — only Cancel is available)",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Arrows: navigate   Space: toggle   Enter: activate   Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+
+    // Confirmation dialog overlay.
+    if s.confirm_recursive {
+        let conf = centered_rect(50, 25, area);
+        f.render_widget(Clear, conf);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .title(Span::styled(
+                " Confirm recursive chmod ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(conf);
+        f.render_widget(block, conf);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "  Apply mode {:o} to ALL entries under:",
+            s.mode
+        )));
+        lines.push(Line::from(format!("    {}", s.path.display())));
+        lines.push(Line::from(""));
+        let yes_style = if s.confirm_cursor == 0 {
+            Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Red)
+        };
+        let no_style = if s.confirm_cursor == 1 {
+            Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(" Yes, apply ", yes_style),
+            Span::raw("    "),
+            Span::styled(" Cancel ", no_style),
+        ]));
+        let para = Paragraph::new(lines);
+        f.render_widget(para, inner);
+    }
+}
+
+fn mode_string(mode: u32, is_dir: bool) -> String {
+    let mut s = String::with_capacity(10);
+    s.push(if is_dir { 'd' } else { '-' });
+    let triplet = |bits: u32, ext_bit: u32, ext_lower: char, ext_upper: char| -> String {
+        let r = if bits & 0o4 != 0 { 'r' } else { '-' };
+        let w = if bits & 0o2 != 0 { 'w' } else { '-' };
+        let x_on = bits & 0o1 != 0;
+        let x = if mode & ext_bit != 0 {
+            if x_on { ext_lower } else { ext_upper }
+        } else if x_on {
+            'x'
+        } else {
+            '-'
+        };
+        format!("{}{}{}", r, w, x)
+    };
+    s.push_str(&triplet((mode >> 6) & 0o7, 0o4000, 's', 'S'));
+    s.push_str(&triplet((mode >> 3) & 0o7, 0o2000, 's', 'S'));
+    s.push_str(&triplet(mode & 0o7, 0o1000, 't', 'T'));
+    s
+}
+
+// ============================================================================
+// Editor view
+// ============================================================================
+
+fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(editor) = app.editor.as_mut() else {
+        return;
+    };
+    editor.report_size(area.width, area.height);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Title bar
+    let title = editor.title();
+    let title_style = Style::default()
+        .bg(Color::Rgb(20, 30, 50))
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {:width$}", title, width = chunks[0].width as usize),
+            title_style,
+        ))),
+        chunks[0],
+    );
+
+    // Body (highlighted lines)
+    let lines = editor.view_lines(chunks[1].height, chunks[1].width);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(Color::Rgb(15, 15, 25))),
+        chunks[1],
+    );
+
+    // Hint bar
+    let hint = editor.hint();
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+
+    // Prompts overlay
+    if let Some(prompt) = editor.prompt.clone() {
+        match prompt {
+            EditorPrompt::Message { text, .. } => {
+                let bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {} ", text),
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    bar,
+                );
+            }
+            EditorPrompt::GotoLine { input } => {
+                let bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            " Goto line: ",
+                            Style::default().bg(Color::Yellow).fg(Color::Black),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            input,
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("█", Style::default().fg(Color::Yellow)),
+                    ])),
+                    bar,
+                );
+            }
+            EditorPrompt::UnsavedClose { selection } => {
+                let popup = centered_rect(50, 25, area);
+                f.render_widget(Clear, popup);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Unsaved changes ");
+                let inner = block.inner(popup);
+                f.render_widget(block, popup);
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(""));
+                lines.push(Line::from(
+                    "  This file has unsaved changes.".to_string(),
+                ));
+                lines.push(Line::from(""));
+                let opt_style = |i: u8| -> Style {
+                    if i == selection {
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" Save & Close ", opt_style(0)),
+                    Span::raw("  "),
+                    Span::styled(" Discard ", opt_style(1)),
+                    Span::raw("  "),
+                    Span::styled(" Cancel ", opt_style(2)),
+                ]));
+                f.render_widget(Paragraph::new(lines), inner);
+            }
+            EditorPrompt::LargeFile { selection, size } => {
+                let popup = centered_rect(60, 30, area);
+                f.render_widget(Clear, popup);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Large or binary file ");
+                let inner = block.inner(popup);
+                f.render_widget(block, popup);
+                let mb = size as f64 / (1024.0 * 1024.0);
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(""));
+                lines.push(Line::from(format!(
+                    "  This file is {:.1} MB or appears to contain binary data.",
+                    mb,
+                )));
+                lines.push(Line::from(
+                    "  Editing it may be slow or destructive.".to_string(),
+                ));
+                lines.push(Line::from(""));
+                let opt_style = |i: u8| -> Style {
+                    if i == selection {
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" Open anyway ", opt_style(0)),
+                    Span::raw("    "),
+                    Span::styled(" Cancel ", opt_style(1)),
+                ]));
+                f.render_widget(Paragraph::new(lines), inner);
+            }
+        }
     }
 }
