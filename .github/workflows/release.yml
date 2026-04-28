@@ -1,0 +1,154 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Rename binary
+        run: cp target/x86_64-unknown-linux-gnu/release/diskvis diskvis-linux-x86_64
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build .deb
+        run: cargo deb --no-build --target x86_64-unknown-linux-gnu
+      - name: Locate .deb
+        id: deb
+        run: |
+          DEB=$(ls target/x86_64-unknown-linux-gnu/debian/*.deb | head -n1)
+          echo "path=$DEB" >> "$GITHUB_OUTPUT"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            diskvis-linux-x86_64
+            ${{ steps.deb.outputs.path }}
+
+  build-linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build release with cross
+        run: cross build --release --target aarch64-unknown-linux-gnu
+      - name: Rename binary
+        run: cp target/aarch64-unknown-linux-gnu/release/diskvis diskvis-linux-aarch64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: diskvis-linux-aarch64
+
+  build-macos-x86_64:
+    name: macOS x86_64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --target x86_64-apple-darwin
+      - name: Rename binary
+        run: cp target/x86_64-apple-darwin/release/diskvis diskvis-macos-x86_64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64
+          path: diskvis-macos-x86_64
+
+  build-macos-aarch64:
+    name: macOS aarch64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Rename binary
+        run: cp target/aarch64-apple-darwin/release/diskvis diskvis-macos-aarch64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: diskvis-macos-aarch64
+
+  build-windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Rename binary
+        shell: pwsh
+        run: Copy-Item target/x86_64-pc-windows-msvc/release/diskvis.exe diskvis-windows-x86_64.exe
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: diskvis-windows-x86_64.exe
+
+  release:
+    name: Publish release
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-x86_64
+      - build-macos-aarch64
+      - build-windows-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name 'diskvis-*' -o -name '*.deb' \) -exec cp {} dist/ \;
+          ls -la dist
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
