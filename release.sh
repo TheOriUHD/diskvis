@@ -12,7 +12,7 @@ fi
 sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 
 # commit, tag, push — triggers GitHub Actions
-git add Cargo.toml
+git add .
 git commit -m "release: v$VERSION"
 git tag "v$VERSION"
 git push && git push --tags
