@@ -45,6 +45,7 @@ enum View {
     Warnings,
     Permissions,
     Editor,
+    NewItem,
 }
 
 #[derive(Clone, Default)]
@@ -164,6 +165,8 @@ pub struct App {
     pub perms: Option<PermsState>,
     /// Embedded text editor (when active).
     pub editor: Option<Editor>,
+    /// New file/dir creation overlay (when active).
+    pub new_item: Option<NewItemState>,
     /// Set when the user requests application exit (e.g. clicks the [✕]
     /// title-bar button). Polled by the run loop.
     pub should_quit: bool,
@@ -299,6 +302,57 @@ pub fn is_root() -> bool {
     users::get_current_uid() == 0
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NewItemKind {
+    File,
+    Dir,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewField {
+    Name,
+    Perm,
+    Buttons,
+}
+
+pub struct NewItemState {
+    pub kind: NewItemKind,
+    pub location: PathBuf,
+    pub name: String,
+    /// Octal permission as a 3-4 digit string (e.g. "644").
+    pub perm_input: String,
+    field: NewField,
+    /// 0 = Create, 1 = Cancel.
+    button: u8,
+    pub error: Option<String>,
+}
+
+impl NewItemState {
+    fn new(kind: NewItemKind, location: PathBuf) -> Self {
+        let perm = match kind {
+            NewItemKind::File => "644",
+            NewItemKind::Dir => "755",
+        };
+        Self {
+            kind,
+            location,
+            name: String::new(),
+            perm_input: perm.to_string(),
+            field: NewField::Name,
+            button: 0,
+            error: None,
+        }
+    }
+
+    fn perm_octal(&self) -> Option<u32> {
+        let s = self.perm_input.trim();
+        if s.is_empty() {
+            return None;
+        }
+        u32::from_str_radix(s, 8).ok().filter(|m| *m <= 0o7777)
+    }
+}
+
 impl App {
     pub fn new(
         root: Node,
@@ -337,6 +391,7 @@ impl App {
             spot_rx: None,
             perms: None,
             editor: None,
+            new_item: None,
             should_quit: false,
         }
     }
@@ -365,7 +420,6 @@ impl App {
             Mode::Tree => display::tree::render(&self.root, &opts),
             Mode::Bars => display::bars::render(&self.root, &opts),
             Mode::Treemap => display::treemap::render(&self.root, &opts),
-            Mode::Flat => display::flat::render(&self.root, &opts),
         };
         self.filter_rows(raw)
     }
@@ -746,6 +800,17 @@ impl App {
         }
     }
 
+    fn open_new_item(&mut self, kind: NewItemKind) {
+        // Create relative to the current root (the directory we're viewing).
+        let location = self.root.path.clone();
+        if !location.is_dir() {
+            self.flash("cannot create here: not a directory");
+            return;
+        }
+        self.new_item = Some(NewItemState::new(kind, location));
+        self.view = View::NewItem;
+    }
+
     fn save_settings(&mut self) {
         match self.config.save() {
             Ok(()) => self.flash("Settings saved to ~/.config/diskvis/config.toml"),
@@ -1069,6 +1134,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // New item creation overlay swallows keys when open.
+    if app.new_item.is_some() {
+        handle_new_item_key(app, key);
+        return false;
+    }
+
     // Permissions inspector swallows keys when open.
     if app.perms.is_some() {
         handle_perms_key(app, key);
@@ -1112,9 +1183,9 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             app.view = View::Main;
             return false;
         }
-        View::Permissions | View::Editor => {
-            // Handled above via app.perms / app.editor branches; the View enum
-            // is purely a draw-state marker for these overlays.
+        View::Permissions | View::Editor | View::NewItem => {
+            // Handled above via app.perms / app.editor / app.new_item branches;
+            // the View enum is purely a draw-state marker for these overlays.
             return false;
         }
         View::Warnings => {
@@ -1166,6 +1237,8 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             app.view = View::Settings;
         }
         KeyCode::Char('i') => app.open_perms_inspector(),
+        KeyCode::Char('n') => app.open_new_item(NewItemKind::File),
+        KeyCode::Char('N') => app.open_new_item(NewItemKind::Dir),
         KeyCode::Char(' ') => app.open_spotlight(),
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.open_spotlight();
@@ -1173,7 +1246,6 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('1') => app.config.mode = Mode::Tree,
         KeyCode::Char('2') => app.config.mode = Mode::Bars,
         KeyCode::Char('3') => app.config.mode = Mode::Treemap,
-        KeyCode::Char('4') => app.config.mode = Mode::Flat,
         KeyCode::Char('f') => app.config.show_files = !app.config.show_files,
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('.') | KeyCode::Char('h') => {
@@ -1550,7 +1622,7 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
                     app.warnings_scroll = (app.warnings_scroll + 3)
                         .min(app.warnings.len().saturating_sub(1));
                 }
-                View::Help | View::Permissions | View::Editor => {}
+                View::Help | View::Permissions | View::Editor | View::NewItem => {}
             }
             return;
         }
@@ -1566,7 +1638,7 @@ pub fn handle_mouse_event(app: &mut App, m: MouseEvent) {
                 View::Warnings => {
                     app.warnings_scroll = app.warnings_scroll.saturating_sub(3);
                 }
-                View::Help | View::Permissions | View::Editor => {}
+                View::Help | View::Permissions | View::Editor | View::NewItem => {}
             }
             return;
         }
@@ -1755,6 +1827,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         View::Warnings => draw_warnings(f, area, app),
         View::Permissions => draw_permissions(f, area, app),
         View::Editor => draw_editor(f, area, app),
+        View::NewItem => draw_new_item(f, area, app),
         View::Main => {}
     }
 
@@ -1770,7 +1843,6 @@ fn draw_title(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         (Mode::Tree, "Tree"),
         (Mode::Bars, "Bars"),
         (Mode::Treemap, "Treemap"),
-        (Mode::Flat, "Flat"),
     ];
 
     let mut x = area.x;
@@ -2309,7 +2381,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from("  r              rescan current directory"),
         Line::from(""),
         Line::from("Display"),
-        Line::from("  1 2 3 4        switch mode (tree/bars/treemap/flat)"),
+        Line::from("  1 2 3          switch mode (tree/bars/treemap)"),
         Line::from("  s              cycle sort (size↓ size↑ name↑ name↓)"),
         Line::from("  c              cycle theme"),
         Line::from("  f              toggle showing files"),
@@ -2328,6 +2400,8 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from("  y              yank path to clipboard"),
         Line::from("  e              open file in editor"),
         Line::from("  i              permission inspector"),
+        Line::from("  n              new file"),
+        Line::from("  N              new directory"),
         Line::from("  S              settings panel"),
         Line::from("  w              warnings overlay"),
         Line::from("  Space / Ctrl-P open path spotlight"),
@@ -2951,44 +3025,47 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     };
     editor.report_size(area.width, area.height);
 
+    // Editor surface: clear the background so the underlying view never
+    // bleeds through, then render a single bordered block that owns the
+    // entire area. Title/body/hint live inside the block.
+    f.render_widget(Clear, area);
+    let editor_bg = Color::Rgb(10, 10, 20);
+    let surface_style = Style::default().bg(editor_bg).fg(Color::White);
+    let title = format!(" {} ", editor.title());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(80, 100, 140)).bg(editor_bg))
+        .style(surface_style)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .bg(editor_bg)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
 
-    // Title bar
-    let title = editor.title();
-    let title_style = Style::default()
-        .bg(Color::Rgb(20, 30, 50))
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    // Body (highlighted lines) on the dark surface.
+    let lines = editor.view_lines(chunks[0].height, chunks[0].width);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {:width$}", title, width = chunks[0].width as usize),
-            title_style,
-        ))),
+        Paragraph::new(lines).style(surface_style),
         chunks[0],
     );
 
-    // Body (highlighted lines)
-    let lines = editor.view_lines(chunks[1].height, chunks[1].width);
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(Color::Rgb(15, 15, 25))),
-        chunks[1],
-    );
-
-    // Hint bar
+    // Hint bar inside the editor block.
     let hint = editor.hint();
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(140, 150, 180)).bg(editor_bg),
         ))),
-        chunks[2],
+        chunks[1],
     );
 
     // Prompts overlay
@@ -3100,4 +3177,309 @@ fn draw_editor(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             }
         }
     }
+}
+
+// ============================================================================
+// New file / new directory overlay
+// ============================================================================
+
+fn handle_new_item_key(app: &mut App, key: KeyEvent) {
+    let Some(state) = app.new_item.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.new_item = None;
+            app.view = View::Main;
+            return;
+        }
+        KeyCode::Tab => {
+            state.field = match state.field {
+                NewField::Name => NewField::Perm,
+                NewField::Perm => NewField::Buttons,
+                NewField::Buttons => NewField::Name,
+            };
+        }
+        KeyCode::BackTab => {
+            state.field = match state.field {
+                NewField::Name => NewField::Buttons,
+                NewField::Perm => NewField::Name,
+                NewField::Buttons => NewField::Perm,
+            };
+        }
+        KeyCode::Left if state.field == NewField::Buttons => {
+            state.button = 0;
+        }
+        KeyCode::Right if state.field == NewField::Buttons => {
+            state.button = 1;
+        }
+        KeyCode::Backspace => match state.field {
+            NewField::Name => {
+                state.name.pop();
+                state.error = None;
+            }
+            NewField::Perm => {
+                state.perm_input.pop();
+                state.error = None;
+            }
+            NewField::Buttons => {}
+        },
+        KeyCode::Char(c) => match state.field {
+            NewField::Name => {
+                // Reasonable filename character set; allow `/` for nested paths.
+                if !c.is_control() {
+                    state.name.push(c);
+                    state.error = None;
+                }
+            }
+            NewField::Perm => {
+                if c.is_ascii_digit() && c <= '7' && state.perm_input.len() < 4 {
+                    state.perm_input.push(c);
+                    state.error = None;
+                }
+            }
+            NewField::Buttons => {}
+        },
+        KeyCode::Enter => {
+            if state.field == NewField::Buttons && state.button == 1 {
+                app.new_item = None;
+                app.view = View::Main;
+                return;
+            }
+            create_new_item(app);
+        }
+        _ => {}
+    }
+}
+
+fn create_new_item(app: &mut App) {
+    let (kind, location, name, mode) = {
+        let Some(state) = app.new_item.as_mut() else {
+            return;
+        };
+        if state.name.trim().is_empty() {
+            state.error = Some("name is empty".to_string());
+            return;
+        }
+        let mode = match state.perm_octal() {
+            Some(m) => m,
+            None => {
+                state.error = Some(format!("invalid octal: {}", state.perm_input));
+                return;
+            }
+        };
+        (
+            state.kind,
+            state.location.clone(),
+            state.name.clone(),
+            mode,
+        )
+    };
+
+    let target = location.join(&name);
+    if target.exists() {
+        if let Some(state) = app.new_item.as_mut() {
+            state.error = Some(format!("Already exists: {}", name));
+        }
+        app.flash(format!("Already exists: {}", name));
+        return;
+    }
+
+    // Support nested creation: if name contains `/`, ensure parents exist.
+    if let Some(parent) = target.parent() {
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                if let Some(state) = app.new_item.as_mut() {
+                    state.error = Some(format!("create_dir_all: {}", e));
+                }
+                return;
+            }
+        }
+    }
+
+    let create_result = match kind {
+        NewItemKind::File => std::fs::File::create(&target).map(|_| ()),
+        NewItemKind::Dir => std::fs::create_dir(&target),
+    };
+    if let Err(e) = create_result {
+        if let Some(state) = app.new_item.as_mut() {
+            state.error = Some(format!("create error: {}", e));
+        }
+        return;
+    }
+    if let Err(e) =
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+    {
+        app.flash(format!("chmod warning: {}", e));
+    }
+
+    let created_label = name.clone();
+    let cur = app.root.path.clone();
+    app.new_item = None;
+    app.view = View::Main;
+    app.rescan_at(cur);
+    app.flash(format!("Created: {}", created_label));
+
+    // Try to select the newly created entry. If the user typed a nested path,
+    // select its top-level component (the only thing visible at depth 0).
+    let top = std::path::Path::new(&created_label)
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or(created_label);
+    let rows = app.build_rows();
+    if let Some(idx) = rows
+        .iter()
+        .position(|r| !r.is_hidden_summary && r.name == top)
+    {
+        app.cursor = idx;
+    }
+}
+
+fn perm_rwx_string(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    let triplet = |bits: u32, ext_bit: u32, ext_lower: char, ext_upper: char| -> [char; 3] {
+        let r = if bits & 0o4 != 0 { 'r' } else { '-' };
+        let w = if bits & 0o2 != 0 { 'w' } else { '-' };
+        let x_on = bits & 0o1 != 0;
+        let x = if mode & ext_bit != 0 {
+            if x_on { ext_lower } else { ext_upper }
+        } else if x_on {
+            'x'
+        } else {
+            '-'
+        };
+        [r, w, x]
+    };
+    for ch in triplet((mode >> 6) & 0o7, 0o4000, 's', 'S') {
+        s.push(ch);
+    }
+    for ch in triplet((mode >> 3) & 0o7, 0o2000, 's', 'S') {
+        s.push(ch);
+    }
+    for ch in triplet(mode & 0o7, 0o1000, 't', 'T') {
+        s.push(ch);
+    }
+    s
+}
+
+fn draw_new_item(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(state) = app.new_item.as_ref() else {
+        return;
+    };
+
+    let popup = centered_rect(60, 50, area);
+    f.render_widget(Clear, popup);
+    let title = match state.kind {
+        NewItemKind::File => " New File ",
+        NewItemKind::Dir => " New Directory ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  Location: "),
+        Span::styled(
+            state.location.display().to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let name_active = state.field == NewField::Name;
+    let name_field_style = if name_active {
+        Style::default().bg(Color::Rgb(40, 40, 60)).fg(Color::White)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let mut name_spans = vec![
+        Span::raw("  Name:  "),
+        Span::styled(
+            format!(" {} ", if state.name.is_empty() { "" } else { state.name.as_str() }),
+            name_field_style,
+        ),
+    ];
+    if name_active {
+        name_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+    }
+    lines.push(Line::from(name_spans));
+    lines.push(Line::from(""));
+
+    let perm_active = state.field == NewField::Perm;
+    let perm_field_style = if perm_active {
+        Style::default().bg(Color::Rgb(40, 40, 60)).fg(Color::White)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let rwx = state
+        .perm_octal()
+        .map(perm_rwx_string)
+        .unwrap_or_else(|| "?".to_string());
+    let mut perm_spans = vec![
+        Span::raw("  Permissions:  "),
+        Span::styled(format!(" {} ", state.perm_input), perm_field_style),
+    ];
+    if perm_active {
+        perm_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+    }
+    perm_spans.push(Span::raw("  "));
+    perm_spans.push(Span::styled(
+        format!("[{}]", rwx),
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(perm_spans));
+    lines.push(Line::from(""));
+
+    let in_buttons = state.field == NewField::Buttons;
+    let create_active = in_buttons && state.button == 0;
+    let cancel_active = in_buttons && state.button == 1;
+    let create_style = if create_active {
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let cancel_style = if cancel_active {
+        Style::default()
+            .bg(Color::Red)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(" [Create] ", create_style),
+        Span::raw("        "),
+        Span::styled(" [Cancel] ", cancel_style),
+    ]));
+    lines.push(Line::from(""));
+
+    if let Some(err) = state.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!("  ! {}", err),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  Tab: cycle field   Enter: create   Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

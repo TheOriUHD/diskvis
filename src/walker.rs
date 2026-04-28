@@ -89,12 +89,14 @@ impl Node {
             .sum::<usize>()
     }
 
+    #[allow(dead_code)]
     pub fn all_files(&self) -> Vec<&Node> {
         let mut out = Vec::new();
         self.collect_files(&mut out);
         out
     }
 
+    #[allow(dead_code)]
     fn collect_files<'a>(&'a self, out: &mut Vec<&'a Node>) {
         if !self.is_dir {
             out.push(self);
@@ -202,16 +204,27 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         }
     }
 
-    // Recurse into subdirs in parallel. `WalkOptions` (including the progress
-    // callback) is `Sync`, so it can be shared across rayon worker threads.
+    // Recurse into subdirs. For directories with very few children parallel
+    // dispatch is pure overhead, so we only fan out into rayon when there are
+    // enough siblings to make scheduling worthwhile.
     let warn_box: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    subdirs.par_iter_mut().for_each(|child| {
-        let mut local = Vec::new();
-        build_dir(child, opts, &mut local);
-        if !local.is_empty() {
-            warn_box.lock().unwrap().extend(local);
+    if subdirs.len() > 4 {
+        subdirs.par_iter_mut().for_each(|child| {
+            let mut local = Vec::new();
+            build_dir(child, opts, &mut local);
+            if !local.is_empty() {
+                warn_box.lock().unwrap().extend(local);
+            }
+        });
+    } else {
+        for child in subdirs.iter_mut() {
+            let mut local = Vec::new();
+            build_dir(child, opts, &mut local);
+            if !local.is_empty() {
+                warn_box.lock().unwrap().extend(local);
+            }
         }
-    });
+    }
     if let Ok(mut w) = warn_box.into_inner() {
         warnings.append(&mut w);
     }

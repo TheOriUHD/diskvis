@@ -32,7 +32,6 @@ pub enum Mode {
     Tree,
     Bars,
     Treemap,
-    Flat,
 }
 
 #[derive(Parser, Debug)]

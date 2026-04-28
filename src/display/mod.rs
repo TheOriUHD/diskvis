@@ -1,5 +1,4 @@
 pub mod bars;
-pub mod flat;
 pub mod tree;
 pub mod treemap;
 
