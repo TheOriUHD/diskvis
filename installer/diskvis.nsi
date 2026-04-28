@@ -9,7 +9,7 @@
 
 !define APP_NAME       "diskvis"
 !define APP_PUBLISHER  "TheOriUHD"
-!define APP_VERSION    "1.1.0"
+!define APP_VERSION    "1.3.0"
 !define APP_EXE        "diskvis.exe"
 !define APP_INSTALLDIR "$PROGRAMFILES64\diskvis"
 !define APP_REGKEY     "Software\Microsoft\Windows\CurrentVersion\Uninstall\diskvis"
@@ -176,6 +176,7 @@ Section "diskvis (required)" SecCore
     WriteRegStr HKLM "${APP_REGKEY}" "URLInfoAbout" "${APP_URL}"
     WriteRegStr HKLM "${APP_REGKEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
     WriteRegStr HKLM "${APP_REGKEY}" "InstallLocation" "$INSTDIR"
+    WriteRegStr HKLM "${APP_REGKEY}" "DisplayIcon" "$INSTDIR\${APP_EXE}"
     WriteRegDWORD HKLM "${APP_REGKEY}" "NoModify" 1
     WriteRegDWORD HKLM "${APP_REGKEY}" "NoRepair" 1
 

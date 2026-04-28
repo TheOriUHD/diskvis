@@ -24,6 +24,10 @@ human-panic = "2"
 toml = "0.8"
 arboard = "3"
 dirs = "5"
+rayon = "1"
+
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
 
 [package.metadata.deb]
 maintainer = "TheOriUHD <theoriuhd@users.noreply.github.com>"

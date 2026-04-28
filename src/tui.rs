@@ -25,6 +25,62 @@ use crate::config::{Config, Theme};
 use crate::display::{self, RenderOptions, Row};
 use crate::walker::{self, Node, WalkOptions};
 
+/// Strip the Windows `\\?\` extended-length path prefix from a path's
+/// display string. This prefix is an internal NT-namespace marker that
+/// should never appear in user-facing output. Also rewrites the synthetic
+/// `\\?\ThisPC` sentinel to the friendly label `This PC`.
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if s == "\\\\?\\ThisPC" {
+        return "This PC".to_string();
+    }
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        return rest.to_string();
+    }
+    s.into_owned()
+}
+
+/// Render the navigation breadcrumb for the current root, e.g.
+/// `This PC › C:\ › Users › Philipp`. On Unix this collapses to a
+/// regular `/`-separated path with the leading `/` shown as `/`.
+fn breadcrumb(p: &Path) -> String {
+    let display = display_path(p);
+    #[cfg(windows)]
+    {
+        // Walk components, prefixing with "This PC" so users always know
+        // where they are in the hierarchy.
+        if display == "This PC" {
+            return "This PC".to_string();
+        }
+        let mut parts: Vec<String> = vec!["This PC".to_string()];
+        let mut iter = std::path::Path::new(&display).components().peekable();
+        while let Some(c) = iter.next() {
+            match c {
+                std::path::Component::Prefix(p) => {
+                    let mut s = p.as_os_str().to_string_lossy().into_owned();
+                    // Drive prefix becomes `C:\`.
+                    if matches!(iter.peek(), Some(std::path::Component::RootDir)) {
+                        s.push('\\');
+                        iter.next();
+                    }
+                    parts.push(s);
+                }
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(n) => {
+                    parts.push(n.to_string_lossy().into_owned());
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => parts.push("..".to_string()),
+            }
+        }
+        return parts.join("  ›  ");
+    }
+    #[cfg(not(windows))]
+    {
+        display
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum View {
     Main,
@@ -179,6 +235,17 @@ impl App {
         min_size: u64,
         warnings: Vec<String>,
     ) -> Self {
+        // On Windows, ensure "This PC" is always the bottom of the nav
+        // stack so the user can never navigate above it.
+        #[cfg(windows)]
+        let nav_stack: Vec<PathBuf> = if walker::is_this_pc(&root.path) {
+            Vec::new()
+        } else {
+            vec![walker::this_pc_sentinel()]
+        };
+        #[cfg(not(windows))]
+        let nav_stack: Vec<PathBuf> = Vec::new();
+
         Self {
             root,
             initial_path,
@@ -189,7 +256,7 @@ impl App {
             view: View::Main,
             settings_cursor: 0,
             settings_scroll: 0,
-            nav_stack: Vec::new(),
+            nav_stack,
             status_msg: None,
             last_size: (80, 24),
             rescanning: false,
@@ -480,9 +547,25 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        // On Windows, the nav stack is seeded with "This PC" so the user
+        // can never go above it. On Unix, allow climbing all the way to /.
+        #[cfg(windows)]
+        {
+            if walker::is_this_pc(&self.root.path) {
+                return;
+            }
+        }
         if let Some(prev) = self.nav_stack.pop() {
             self.rescan_at(prev);
         } else if let Some(parent) = self.root.path.parent().map(|p| p.to_path_buf()) {
+            #[cfg(windows)]
+            {
+                // Reaching above a drive letter on Windows lands in This PC.
+                if parent.as_os_str().is_empty() || parent.parent().is_none() {
+                    self.rescan_at(walker::this_pc_sentinel());
+                    return;
+                }
+            }
             self.rescan_at(parent);
         } else {
             #[cfg(windows)]
@@ -621,8 +704,21 @@ impl App {
 
     fn open_spotlight(&mut self) {
         self.ensure_spotlight_worker();
-        let init = format!("{}/", self.root.path.display());
-        let init = init.replace("//", "/");
+        #[cfg(windows)]
+        let init = if walker::is_this_pc(&self.root.path) {
+            String::new()
+        } else {
+            let mut s = display_path(&self.root.path);
+            if !s.ends_with('\\') && !s.ends_with('/') {
+                s.push('\\');
+            }
+            s
+        };
+        #[cfg(not(windows))]
+        let init = {
+            let s = format!("{}/", self.root.path.display());
+            s.replace("//", "/")
+        };
         let mut s = SpotlightState::new(init);
         s.pending_refresh = true;
         s.last_input_change = Instant::now();
@@ -1652,41 +1748,50 @@ fn draw_title(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         x = x.saturating_add(pill_w + 1);
     }
 
-    // Right side: [?] [⚙] [✕]
+    // Right side: stylised [?] [⚙] [✕] action buttons.
     let right_btns: [(&str, Action); 3] = [
         ("[?]", Action::OpenHelp),
         ("[⚙]", Action::OpenSettings),
         ("[✕]", Action::Quit),
     ];
+    // One space between each button => total = sum(widths) + (n-1).
     let right_total: u16 = right_btns
         .iter()
-        .map(|(s, _)| s.chars().count() as u16 + 1)
-        .sum();
+        .map(|(s, _)| s.chars().count() as u16)
+        .sum::<u16>()
+        + (right_btns.len() as u16).saturating_sub(1);
     if area.width > right_total + 2 {
-        let mut rx = area.x + area.width - right_total;
-        for (label, act) in right_btns.iter() {
+        let mut rx = area.x + area.width.saturating_sub(right_total);
+        for (i, (label, act)) in right_btns.iter().enumerate() {
             let w = label.chars().count() as u16;
             let rect = Rect::new(rx, y, w, 1);
-            let style = match act {
-                Action::CloseOverlay => Style::default().fg(Color::Red),
-                Action::Quit => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Yellow),
+            let base = match act {
+                Action::Quit => Color::Red,
+                Action::OpenSettings => Color::Cyan,
+                _ => Color::Yellow,
             };
+            let style = Style::default().fg(base).add_modifier(Modifier::BOLD);
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(*label, style))),
                 rect,
             );
             app.hits.push(HitRegion { rect, action: *act });
-            rx = rx.saturating_add(w + 1);
+            rx = rx.saturating_add(w);
+            // One-space gutter between buttons (but not after the last).
+            if i + 1 < right_btns.len() {
+                rx = rx.saturating_add(1);
+            }
         }
     }
 
-    // Path in middle (truncated)
+    // Path in middle (truncated). Render as a breadcrumb so the user always
+    // sees where they are; on Windows this includes the synthetic "This PC"
+    // root prefix.
     let avail_start = x + 1;
     let avail_end = area.x + area.width.saturating_sub(right_total + 2);
     if avail_end > avail_start {
         let avail = (avail_end - avail_start) as usize;
-        let mut path_str = app.root.path.display().to_string();
+        let mut path_str = breadcrumb(&app.root.path);
         if path_str.chars().count() > avail {
             let take_tail = avail.saturating_sub(1);
             let tail: String = path_str
@@ -1850,7 +1955,7 @@ fn draw_selected_path(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .get(app.cursor)
         .and_then(|r| r.path.clone())
         .unwrap_or_else(|| app.root.path.clone());
-    let mut s = p.display().to_string();
+    let mut s = display_path(&p);
     let max_w = area.width as usize;
     if s.chars().count() > max_w {
         let take_tail = max_w.saturating_sub(1);
@@ -1913,7 +2018,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .split(area);
 
     // Row 1: path + totals + warnings.
-    let path_str = app.root.path.display().to_string();
+    let path_str = breadcrumb(&app.root.path);
     let warn = if app.warnings.is_empty() {
         String::new()
     } else {
@@ -2374,7 +2479,7 @@ fn draw_spotlight(f: &mut ratatui::Frame, area: Rect, app: &App) {
                         .bg(bg),
                 ),
                 Span::styled(
-                    cand.path.display().to_string(),
+                    display_path(&cand.path),
                     Style::default()
                         .fg(name_color)
                         .bg(bg)

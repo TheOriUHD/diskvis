@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
+use rayon::prelude::*;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,7 +102,16 @@ pub fn vfs_excludes() -> Vec<&'static str> {
 
 #[cfg(windows)]
 pub fn vfs_excludes() -> Vec<&'static str> {
-    vec![]
+    // Windows system folders that cause permission spam or are uninteresting.
+    // Matched by basename (no leading slash) so they apply at any depth.
+    vec![
+        "$RECYCLE.BIN",
+        "System Volume Information",
+        "WindowsApps",
+        "WpSystem",
+        "Recovery",
+        "Config.Msi",
+    ]
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -129,28 +140,45 @@ pub fn this_pc_sentinel() -> PathBuf {
 }
 
 /// Build a synthetic [`Node`] tree representing "This PC" — a virtual root
-/// whose children are each available drive (Windows-only).
+/// whose children are each available drive (Windows-only). Each drive's
+/// `size` is its used bytes (total − free); free space is appended to the
+/// drive's display name so renderers surface it.
 #[cfg(windows)]
 pub fn build_this_pc_node() -> Node {
+    use fs2::{free_space, total_space};
     let drives = enumerate_drives();
     let children: Vec<Node> = drives
         .into_iter()
         .map(|p| {
-            let name = p.to_string_lossy().into_owned();
+            let total = total_space(&p).unwrap_or(0);
+            let free = free_space(&p).unwrap_or(0);
+            let used = total.saturating_sub(free);
+            let label = p.to_string_lossy().into_owned();
+            let name = if total > 0 {
+                format!(
+                    "{}  (free: {} / {})",
+                    label,
+                    crate::display::human_size(free),
+                    crate::display::human_size(total),
+                )
+            } else {
+                label
+            };
             Node {
                 path: p,
                 name,
-                size: 0,
+                size: used,
                 is_dir: true,
                 modified: None,
                 children: Vec::new(),
             }
         })
         .collect();
+    let total: u64 = children.iter().map(|c| c.size).sum();
     Node {
         path: this_pc_sentinel(),
-        name: "[This PC]".to_string(),
-        size: 0,
+        name: "This PC".to_string(),
+        size: total,
         is_dir: true,
         modified: None,
         children,
@@ -205,6 +233,9 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
         }
     };
 
+    let mut leaves: Vec<Node> = Vec::new();
+    let mut subdirs: Vec<Node> = Vec::new();
+
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -232,19 +263,34 @@ fn build_dir(node: &mut Node, opts: &WalkOptions, warnings: &mut Vec<String>) {
 
         if meta.file_type().is_symlink() {
             let size = meta.len();
-            node.size += size;
-            node.children.push(Node::new(path, false, size, modified));
+            leaves.push(Node::new(path, false, size, modified));
         } else if meta.is_dir() {
-            let mut child = Node::new(path, true, 0, modified);
-            build_dir(&mut child, opts, warnings);
-            node.size += child.size;
-            node.children.push(child);
+            subdirs.push(Node::new(path, true, 0, modified));
         } else if meta.is_file() {
             let size = meta.len();
-            node.size += size;
-            node.children.push(Node::new(path, false, size, modified));
+            leaves.push(Node::new(path, false, size, modified));
         }
     }
+
+    // Recurse into subdirs in parallel. `WalkOptions` (including the progress
+    // callback) is `Sync`, so it can be shared across rayon worker threads.
+    let warn_box: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    subdirs.par_iter_mut().for_each(|child| {
+        let mut local = Vec::new();
+        build_dir(child, opts, &mut local);
+        if !local.is_empty() {
+            warn_box.lock().unwrap().extend(local);
+        }
+    });
+    if let Ok(mut w) = warn_box.into_inner() {
+        warnings.append(&mut w);
+    }
+
+    let leaf_total: u64 = leaves.iter().map(|n| n.size).sum();
+    let dir_total: u64 = subdirs.iter().map(|n| n.size).sum();
+    node.size = leaf_total + dir_total;
+    node.children = leaves;
+    node.children.extend(subdirs);
 }
 
 /// Match an entry against the exclude patterns.

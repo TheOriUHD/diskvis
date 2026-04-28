@@ -35,6 +35,13 @@ fn main() {
         process::exit(1);
     }
 
+    // On Windows, with no explicit path argument, default to the synthetic
+    // "This PC" root so the user starts at the drive picker.
+    #[cfg(windows)]
+    let force_this_pc = cli.path == std::path::Path::new(".");
+    #[cfg(not(windows))]
+    let force_this_pc = false;
+
     // Build effective config: load file, then override with CLI flags.
     let mut cfg = Config::load();
     if let Some(d) = cli.depth {
@@ -97,16 +104,30 @@ fn main() {
         on_progress: Some(&on_progress),
     };
 
-    let scan = match walker::build_tree(&path, &opts) {
-        Ok(n) => n,
-        Err(e) => {
-            if let Some(pb) = pb.as_ref() {
-                pb.finish_and_clear();
+    let scan = if force_this_pc {
+        #[cfg(windows)]
+        {
+            crate::walker::ScanResult {
+                root: crate::walker::build_this_pc_node(),
+                warnings: Vec::new(),
             }
-            if should_log_stderr(cli.verbose) {
-                eprintln!("error: {}", e);
+        }
+        #[cfg(not(windows))]
+        {
+            unreachable!()
+        }
+    } else {
+        match walker::build_tree(&path, &opts) {
+            Ok(n) => n,
+            Err(e) => {
+                if let Some(pb) = pb.as_ref() {
+                    pb.finish_and_clear();
+                }
+                if should_log_stderr(cli.verbose) {
+                    eprintln!("error: {}", e);
+                }
+                process::exit(1);
             }
-            process::exit(1);
         }
     };
     let root = scan.root;
