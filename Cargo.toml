@@ -1,6 +1,6 @@
 [package]
 name = "diskvis"
-version = "0.2.0"
+version = "1.1.0"
 edition = "2021"
 description = "A premium interactive terminal disk usage visualizer"
 license = "MIT"
@@ -22,6 +22,20 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 human-panic = "2"
 toml = "0.8"
+arboard = "3"
+dirs = "5"
+
+[package.metadata.deb]
+maintainer = "TheOriUHD <theoriuhd@users.noreply.github.com>"
+copyright = "2026, TheOriUHD"
+license-file = ["LICENSE", "0"]
+extended-description = "An interactive terminal disk usage visualizer with a TUI."
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/diskvis", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/diskvis/README", "644"],
+]
 
 [profile.release]
 lto = true
