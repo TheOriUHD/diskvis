@@ -79,11 +79,31 @@ jobs:
         run: cargo build --release --target x86_64-apple-darwin
       - name: Rename binary
         run: cp target/x86_64-apple-darwin/release/diskvis diskvis-macos-x86_64
+      - name: Read crate version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Build .pkg installer
+        run: |
+          set -euxo pipefail
+          STAGE=pkgroot
+          mkdir -p "$STAGE/usr/local/bin"
+          cp target/x86_64-apple-darwin/release/diskvis "$STAGE/usr/local/bin/diskvis"
+          chmod 755 "$STAGE/usr/local/bin/diskvis"
+          pkgbuild \
+            --root "$STAGE" \
+            --identifier com.theoriuhd.diskvis \
+            --version "${{ steps.ver.outputs.version }}" \
+            --install-location / \
+            diskvis-macos-x86_64.pkg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-x86_64
-          path: diskvis-macos-x86_64
+          path: |
+            diskvis-macos-x86_64
+            diskvis-macos-x86_64.pkg
 
   build-macos-aarch64:
     name: macOS aarch64
@@ -100,11 +120,31 @@ jobs:
         run: cargo build --release --target aarch64-apple-darwin
       - name: Rename binary
         run: cp target/aarch64-apple-darwin/release/diskvis diskvis-macos-aarch64
+      - name: Read crate version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Build .pkg installer
+        run: |
+          set -euxo pipefail
+          STAGE=pkgroot
+          mkdir -p "$STAGE/usr/local/bin"
+          cp target/aarch64-apple-darwin/release/diskvis "$STAGE/usr/local/bin/diskvis"
+          chmod 755 "$STAGE/usr/local/bin/diskvis"
+          pkgbuild \
+            --root "$STAGE" \
+            --identifier com.theoriuhd.diskvis \
+            --version "${{ steps.ver.outputs.version }}" \
+            --install-location / \
+            diskvis-macos-aarch64.pkg
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64
-          path: diskvis-macos-aarch64
+          path: |
+            diskvis-macos-aarch64
+            diskvis-macos-aarch64.pkg
 
   release:
     name: Publish release
@@ -122,7 +162,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p dist
-          find artifacts -type f \( -name 'diskvis-*' -o -name '*.deb' \) -exec cp {} dist/ \;
+          find artifacts -type f \( -name 'diskvis-*' -o -name '*.deb' -o -name '*.pkg' \) -exec cp {} dist/ \;
           ls -la dist
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

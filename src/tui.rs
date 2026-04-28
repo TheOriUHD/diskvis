@@ -558,6 +558,16 @@ impl App {
     }
 
     fn rescan_at(&mut self, path: PathBuf) {
+        // Guard against vanished / inaccessible paths so we never panic on a
+        // stale nav stack entry or a directory that was removed mid-session.
+        if !path.exists() {
+            self.flash(format!("path no longer exists: {}", path.display()));
+            return;
+        }
+        if !path.is_dir() {
+            self.flash(format!("not a directory: {}", path.display()));
+            return;
+        }
         self.rescanning = true;
         let mut excludes = self.config.active_excludes();
         excludes.extend(self.session_excludes.iter().cloned());
@@ -586,11 +596,32 @@ impl App {
     }
 
     fn go_up(&mut self) {
-        if let Some(prev) = self.nav_stack.pop() {
-            self.rescan_at(prev);
-        } else if let Some(parent) = self.root.path.parent().map(|p| p.to_path_buf()) {
-            self.rescan_at(parent);
+        // Decide where "up" goes without mutating the nav stack yet so a
+        // failure leaves us in a consistent state.
+        let (target, pop) = if let Some(prev) = self.nav_stack.last().cloned() {
+            (prev, true)
+        } else {
+            match self.root.path.parent().map(|p| p.to_path_buf()) {
+                Some(parent) => (parent, false),
+                None => {
+                    self.flash("already at filesystem root");
+                    return;
+                }
+            }
+        };
+        if !target.is_dir() {
+            // Stale nav stack entry or a parent we cannot read — drop the bad
+            // entry (if any) but do not navigate.
+            if pop {
+                self.nav_stack.pop();
+            }
+            self.flash(format!("cannot go up: {} is not accessible", target.display()));
+            return;
         }
+        if pop {
+            self.nav_stack.pop();
+        }
+        self.rescan_at(target);
     }
 
     fn cycle_sort(&mut self) {
