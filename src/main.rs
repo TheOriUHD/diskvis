@@ -312,9 +312,17 @@ fn render_splash_loop(
                 cur_full
             };
 
-            // Knight-rider style sweep so the user sees motion without
-            // promising a real percentage.
-            let bar_w = inner_w.saturating_sub(4);
+            // Bar must fit between the box border, padding, and the trailing
+            // "  NNNNN dirs" counter. Layout for the bar row is:
+            //   `│ ` + bar(bar_w) + `  ` + 5-char counter + ` dirs` + ` │`
+            // Total inner width consumed: bar_w + 1 + 2 + 5 + 5 + 1 = bar_w + 14.
+            // Cap bar_w to leave room and never exceed inner_w - 4.
+            let counter_overhead = 1 + 2 + 5 + 5 + 1; // padding + counter
+            let bar_max = inner_w.saturating_sub(4);
+            let bar_w = inner_w
+                .saturating_sub(counter_overhead)
+                .min(bar_max)
+                .max(1);
             let span = (bar_w as u64) * 2;
             let pos_raw = (tick * 2) % span.max(1);
             let head = if pos_raw < bar_w as u64 {
@@ -346,9 +354,9 @@ fn render_splash_loop(
                     width = inner_w,
                 ),
                 format!(
-                    "│ {:bw$}  {:>5} │",
+                    "│ {:bw$}  {:>5} dirs │",
                     bar,
-                    format!("{} dirs", dirs),
+                    dirs,
                     bw = bar_w,
                 ),
                 format!("│{:^width$}│", "", width = inner_w),

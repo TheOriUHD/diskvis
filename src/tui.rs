@@ -123,6 +123,8 @@ enum Action {
     SettingsRow(usize),
     SettingsResetDefaults,
     SettingsClearFilter,
+    /// No-op click target (used for purely informational status segments).
+    Noop,
 }
 
 #[derive(Clone, Copy)]
@@ -538,8 +540,19 @@ impl App {
                 }
                 // Filter query
                 if let Some(q) = &q {
-                    if !r.name.is_empty() && !r.name.to_lowercase().contains(q) {
-                        return false;
+                    if !r.name.is_empty() {
+                        let name_lc = r.name.to_lowercase();
+                        // Filter semantics:
+                        //   `.`     -> any entry whose name contains a `.`
+                        //              (i.e. has any extension).
+                        //   `.ext`  -> case-insensitive substring match,
+                        //              which naturally hits names ending
+                        //              with or containing `.ext`.
+                        //   other   -> case-insensitive substring match.
+                        let matches = name_lc.contains(q);
+                        if !matches {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -1129,7 +1142,19 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             editor.handle_key(key)
         };
         if outcome == EditorOutcome::Close {
+            // Tear down the editor and return to the main view. Without
+            // resetting `view`, subsequent keypresses would be swallowed by
+            // the `View::Editor` arm below and the main view would never be
+            // re-entered.
             app.editor = None;
+            app.view = View::Main;
+            // Re-validate the cursor against the (possibly stale) main row
+            // list to avoid out-of-bounds indexing on the next draw.
+            let rows = app.build_rows();
+            let last = App::last_selectable_idx(&rows);
+            if app.cursor > last {
+                app.cursor = last;
+            }
         }
         return false;
     }
@@ -1248,6 +1273,26 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('3') => app.config.mode = Mode::Treemap,
         KeyCode::Char('f') => app.config.show_files = !app.config.show_files,
         KeyCode::Char('s') => app.cycle_sort(),
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            if app.config.depth < 10 {
+                app.config.depth += 1;
+                let cur = app.root.path.clone();
+                app.rescan_at(cur);
+                app.flash(format!("depth: {}", app.config.depth));
+            } else {
+                app.flash("depth: 10 (max)");
+            }
+        }
+        KeyCode::Char('-') => {
+            if app.config.depth > 1 {
+                app.config.depth -= 1;
+                let cur = app.root.path.clone();
+                app.rescan_at(cur);
+                app.flash(format!("depth: {}", app.config.depth));
+            } else {
+                app.flash("depth: 1 (min)");
+            }
+        }
         KeyCode::Char('.') | KeyCode::Char('h') => {
             app.config.view.show_hidden = !app.config.view.show_hidden;
             app.flash(format!(
@@ -1774,6 +1819,7 @@ fn apply_action(app: &mut App, action: Action, is_double: bool) {
         Action::SettingsClearFilter => {
             activate_setting(app, SettingKind::ClearFilter);
         }
+        Action::Noop => {}
     }
 }
 
@@ -2254,6 +2300,11 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Color::Cyan,
         ),
         (
+            format!(" depth: {} ", app.config.depth),
+            Action::Noop,
+            Color::Green,
+        ),
+        (
             format!(" hidden: {} ", onoff(app.config.view.show_hidden)),
             Action::ToggleHidden,
             Color::Yellow,
@@ -2384,6 +2435,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from("  1 2 3          switch mode (tree/bars/treemap)"),
         Line::from("  s              cycle sort (size↓ size↑ name↑ name↓)"),
         Line::from("  c              cycle theme"),
+        Line::from("  + / = / -      adjust depth (1–10)"),
         Line::from("  f              toggle showing files"),
         Line::from("  . or h         toggle hidden files"),
         Line::from("  d              toggle empty dirs"),

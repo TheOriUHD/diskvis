@@ -63,7 +63,7 @@ impl Default for Config {
         let n = excludes.len();
         Config {
             theme: Theme::Default,
-            depth: 2,
+            depth: 1,
             show_files: false,
             show_modified: false,
             excludes,
