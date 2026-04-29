@@ -196,6 +196,7 @@ pub struct App {
 struct ScanMsg {
     target: PathBuf,
     result: std::io::Result<walker::ScanResult>,
+    max_depth: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -203,6 +204,11 @@ struct ScanCacheEntry {
     root: Node,
     warnings: Vec<String>,
     at: Instant,
+    /// The `max_depth` the walker was given when producing this entry.
+    /// `None` means the entry is a full recursive scan; otherwise the
+    /// entry only covers paths up to that depth and may not satisfy a
+    /// later request for a deeper view.
+    max_depth: Option<usize>,
 }
 
 struct TreemapCache {
@@ -784,7 +790,11 @@ impl App {
         let mut used_cache = false;
         if !same_root {
             if let Some(entry) = self.scan_cache.get(&path).cloned() {
-                if entry.at.elapsed() < Duration::from_secs(30) {
+                let depth_ok = match entry.max_depth {
+                    None => true,
+                    Some(d) => d >= self.config.depth,
+                };
+                if depth_ok && entry.at.elapsed() < Duration::from_secs(30) {
                     self.root = entry.root;
                     self.warnings = entry.warnings;
                     self.warnings_scroll = 0;
@@ -813,14 +823,32 @@ impl App {
     }
 
     /// Kick off a background walker thread for `path`. The result is sent
-    /// over `scan_rx` and consumed in `drain_scan_results`.
+    /// over `scan_rx` and consumed in `drain_scan_results`. Deduplicates:
+    /// if a scan for the same target is already in flight, this is a no-op
+    /// so rapid `r` / repeat navigation can't fan out into N orphan
+    /// threads doing identical work.
     fn start_background_scan(&mut self, path: PathBuf) {
+        if let Some(in_flight) = self.scan_target.as_ref() {
+            if in_flight == &path && self.scan_rx.is_some() {
+                return;
+            }
+        }
         let mut excludes = self.config.active_excludes();
         excludes.extend(self.session_excludes.iter().cloned());
         let (tx, rx) = mpsc::channel::<ScanMsg>();
         self.scan_rx = Some(rx);
         self.scan_target = Some(path.clone());
         self.rescanning = true;
+        // Cap the walker's recursion at the current display depth so we
+        // do not spend syscalls on subtrees the renderer would never
+        // show. The renderer still applies its own depth cap on top of
+        // whatever tree comes back.
+        let max_depth = Some(self.config.depth);
+        self.flash(format!(
+            "scan: {} (depth {})",
+            path.display(),
+            self.config.depth,
+        ));
         let scan_path = path.clone();
         thread::spawn(move || {
             // Lower this thread's priority so the UI stays buttery even on
@@ -833,11 +861,13 @@ impl App {
             let opts = WalkOptions {
                 excludes: &excludes,
                 on_progress: None,
+                max_depth,
             };
             let result = walker::build_tree(&scan_path, &opts);
             let _ = tx.send(ScanMsg {
                 target: scan_path,
                 result,
+                max_depth,
             });
         });
     }
@@ -867,12 +897,14 @@ impl App {
                 // otherwise the scan was superseded by a navigation event
                 // and we keep the cache update but discard the swap.
                 let same_root = self.root.path == msg.target;
+                let walked = scan.walked_dirs;
                 self.scan_cache.insert(
                     msg.target.clone(),
                     ScanCacheEntry {
                         root: scan.root.clone(),
                         warnings: scan.warnings.clone(),
                         at: Instant::now(),
+                        max_depth: msg.max_depth,
                     },
                 );
                 self.evict_scan_cache();
@@ -886,6 +918,15 @@ impl App {
                         self.cursor = last;
                     }
                     self.invalidate_caches();
+                    let displayed = rows.len();
+                    self.flash(format!(
+                        "scanned {} dir{} (depth {}), showing {} row{}",
+                        walked,
+                        if walked == 1 { "" } else { "s" },
+                        self.config.depth,
+                        displayed,
+                        if displayed == 1 { "" } else { "s" },
+                    ));
                 }
                 true
             }

@@ -80,7 +80,7 @@ fn main() {
     // scan takes longer than a brief threshold; otherwise fall back to a
     // simple stderr spinner.
     let scan = if interactive {
-        match scan_with_splash(&path, &active_excludes) {
+        match scan_with_splash(&path, &active_excludes, Some(cfg.depth)) {
             Ok(s) => s,
             Err(e) => {
                 if should_log_stderr(cli.verbose) {
@@ -112,6 +112,7 @@ fn main() {
         let opts = WalkOptions {
             excludes: &active_excludes,
             on_progress: Some(&on_progress),
+            max_depth: Some(cfg.depth),
         };
         let result = walker::build_tree(&path, &opts);
         if let Some(pb) = pb.as_ref() {
@@ -219,6 +220,7 @@ fn term_width() -> u16 {
 fn scan_with_splash(
     path: &std::path::Path,
     excludes: &[String],
+    max_depth: Option<usize>,
 ) -> std::io::Result<walker::ScanResult> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -246,6 +248,7 @@ fn scan_with_splash(
         let opts = WalkOptions {
             excludes: &excludes_owned,
             on_progress: Some(&on_progress),
+            max_depth,
         };
         let r = walker::build_tree(&scan_path, &opts);
         done_thread.store(true, Ordering::Relaxed);

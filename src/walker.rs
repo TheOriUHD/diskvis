@@ -1,5 +1,6 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -129,6 +130,13 @@ impl Node {
 pub struct WalkOptions<'a> {
     pub excludes: &'a [String],
     pub on_progress: Option<&'a (dyn Fn(&Path) + Sync)>,
+    /// Maximum recursion depth for the walker itself. The root is depth 0,
+    /// its immediate children are depth 1, and so on. `Some(n)` means we
+    /// stop recursing once we are about to enter a directory whose depth
+    /// would be `>= n`; such directories are still recorded as nodes (so
+    /// the renderer can display them) but their children are not walked.
+    /// `None` means unlimited (full recursive walk).
+    pub max_depth: Option<usize>,
 }
 
 /// Default virtual-filesystem excludes (absolute paths). These are
@@ -143,6 +151,10 @@ pub struct ScanResult {
     /// Buffered instead of printed so the TUI can render them without corrupting
     /// the terminal.
     pub warnings: Vec<String>,
+    /// Number of directories actually walked (i.e. where we called
+    /// `read_dir`). Useful for surfacing how much work the depth cap
+    /// saved versus a full recursive scan.
+    pub walked_dirs: usize,
 }
 
 pub fn build_tree(root: &Path, opts: &WalkOptions) -> std::io::Result<ScanResult> {
@@ -158,15 +170,18 @@ pub fn build_tree(root: &Path, opts: &WalkOptions) -> std::io::Result<ScanResult
                 mode,
             ),
             warnings: Vec::new(),
+            walked_dirs: 0,
         });
     }
     let mut node = Node::new(root.to_path_buf(), true, 0, meta.modified().ok(), mode);
     let mut warnings = Vec::new();
     let root_dev = meta.dev();
-    build_dir(&mut node, opts, &mut warnings, 0, root_dev);
+    let walked = AtomicUsize::new(0);
+    build_dir(&mut node, opts, &mut warnings, 0, root_dev, &walked);
     Ok(ScanResult {
         root: node,
         warnings,
+        walked_dirs: walked.load(Ordering::Relaxed),
     })
 }
 
@@ -176,10 +191,20 @@ fn build_dir(
     warnings: &mut Vec<String>,
     depth: usize,
     root_dev: u64,
+    walked: &AtomicUsize,
 ) {
+    walked.fetch_add(1, Ordering::Relaxed);
     if let Some(cb) = opts.on_progress {
         cb(&node.path);
     }
+
+    // Decide whether children of *this* directory should themselves be
+    // walked. If `max_depth` is set, we stop recursing once a child's
+    // depth would meet or exceed the cap — the children are still
+    // recorded (with their own metadata size) so the renderer has
+    // something to show, but their subtrees are not enumerated.
+    let child_depth = depth + 1;
+    let descend = opts.max_depth.map_or(true, |m| child_depth < m);
 
     let entries = match std::fs::read_dir(&node.path) {
         Ok(e) => e,
@@ -224,7 +249,8 @@ fn build_dir(
             // mounts, or arbitrary places that would balloon the scan).
             match std::fs::metadata(&path) {
                 Ok(target) if target.is_dir() && target.dev() == root_dev => {
-                    subdirs.push(Node::new(path, true, 0, modified, mode));
+                    let init_size = if descend { 0 } else { target.len() };
+                    subdirs.push(Node::new(path, true, init_size, modified, mode));
                 }
                 _ => {
                     let size = meta.len();
@@ -232,38 +258,43 @@ fn build_dir(
                 }
             }
         } else if meta.is_dir() {
-            subdirs.push(Node::new(path, true, 0, modified, mode));
+            let init_size = if descend { 0 } else { meta.len() };
+            subdirs.push(Node::new(path, true, init_size, modified, mode));
         } else if meta.is_file() {
             let size = meta.len();
             leaves.push(Node::new(path, false, size, modified, mode));
         }
     }
 
-    // Recurse into subdirs. Only fan out into rayon at the top two levels
-    // (depth 0 and 1) — deeper levels run serially to avoid spawning a
-    // worker per directory in deep trees, which causes scheduling overhead
-    // to dominate the actual IO work.
-    let warn_box: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let parallel = depth <= 1 && subdirs.len() > 4;
-    if parallel {
-        subdirs.par_iter_mut().for_each(|child| {
-            let mut local = Vec::new();
-            build_dir(child, opts, &mut local, depth + 1, root_dev);
-            if !local.is_empty() {
-                warn_box.lock().unwrap().extend(local);
-            }
-        });
-    } else {
-        for child in subdirs.iter_mut() {
-            let mut local = Vec::new();
-            build_dir(child, opts, &mut local, depth + 1, root_dev);
-            if !local.is_empty() {
-                warn_box.lock().unwrap().extend(local);
+    // Recurse into subdirs unless the depth cap forbids it. Only fan out
+    // into rayon at the top two levels (depth 0 and 1) — deeper levels
+    // run serially to avoid spawning a worker per directory in deep
+    // trees, which causes scheduling overhead to dominate the actual IO
+    // work. The rayon gate is a separate counter from the display depth
+    // cap.
+    if descend {
+        let warn_box: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let parallel = depth <= 1 && subdirs.len() > 4;
+        if parallel {
+            subdirs.par_iter_mut().for_each(|child| {
+                let mut local = Vec::new();
+                build_dir(child, opts, &mut local, child_depth, root_dev, walked);
+                if !local.is_empty() {
+                    warn_box.lock().unwrap().extend(local);
+                }
+            });
+        } else {
+            for child in subdirs.iter_mut() {
+                let mut local = Vec::new();
+                build_dir(child, opts, &mut local, child_depth, root_dev, walked);
+                if !local.is_empty() {
+                    warn_box.lock().unwrap().extend(local);
+                }
             }
         }
-    }
-    if let Ok(mut w) = warn_box.into_inner() {
-        warnings.append(&mut w);
+        if let Ok(mut w) = warn_box.into_inner() {
+            warnings.append(&mut w);
+        }
     }
 
     let leaf_total: u64 = leaves.iter().map(|n| n.size).sum();
